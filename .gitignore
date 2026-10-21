@@ -1,0 +1,33 @@
+# runtime data, scraped player info and game artwork
+data/
+
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# editors
+.idea/
+.vs/
+.vscode/
+
+# c# build output
+bin/
+obj/
+*.user
+
+# game assemblies and any other dlls
+*.dll
+
+# logs and temp files
+*.log
+*.tmp
+
+# os junk
+Thumbs.db
+desktop.ini
+.DS_Store
