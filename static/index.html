@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BLASTATS</title>
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;400;600;700;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css?v=89">
+<script type="module" src="js/main.js?v=89"></script>
+</head>
+<body>
+
+<header>
+  <div class="logo">BLASTATS</div>
+  <div class="status-dot">
+    <div class="dot"></div>
+    <span id="status-text">CONNECTING...</span>
+  </div>
+</header>
+
+<nav>
+  <button class="active" data-action="view" data-view="leaderboard">Leaderboard</button>
+  <button data-action="view" data-view="matches">Match Log</button>
+  <button data-action="view" data-view="weapons">Weapons</button>
+  <button data-action="view" data-view="search">Player Search</button>
+  <button data-action="view" data-view="activity">Activity</button>
+</nav>
+
+<main>
+  <!-- leaderboard -->
+  <div class="view active" id="view-leaderboard">
+    <div class="section-header">
+      <div class="filter-toggle">
+        <button class="active" data-action="lb-filter" data-value="lp">Season LP</button>
+        <button data-action="lb-filter" data-value="elo">ELO</button>
+        <button data-action="lb-filter" data-value="total_lp">Total LP</button>
+        <button data-action="lb-filter" data-value="rounds">Rounds Won</button>
+        <button data-action="lb-filter" data-value="earnings">Earnings</button>
+        <button data-action="lb-filter" data-value="streak">Win Streak</button>
+      </div>
+      <div>
+        <div class="section-title">Leaderboard</div>
+        <div class="section-sub" id="lb-updated">Loading...</div>
+      </div>
+      <div class="season-toggle" id="season-toggle-lp">
+        <button class="active" data-action="lb-season" data-season="current">Current</button>
+        <button data-action="lb-season" data-season="previous">Previous</button>
+      </div>
+      <div class="season-toggle" id="season-toggle-activity" hidden>
+        <button class="active" data-action="lb-active" data-value="true">Active Players</button>
+        <button data-action="lb-active" data-value="false">All Time</button>
+      </div>
+      <div class="season-toggle" id="streak-mode-toggle" hidden>
+        <button class="active" data-action="lb-streak-mode" data-value="highest">Highest</button>
+        <button data-action="lb-streak-mode" data-value="current">Current</button>
+      </div>
+      <div class="season-toggle" id="streak-side-toggle" hidden>
+        <button class="active" data-action="lb-streak-side" data-value="win">Wins</button>
+        <button data-action="lb-streak-side" data-value="loss">Losses</button>
+      </div>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-card">
+        <div class="stat-label">Matches Tracked</div>
+        <div class="stat-value" id="gs-matches">-</div>
+      </div>
+      <div class="stat-card red">
+        <div class="stat-label">Season Ends</div>
+        <div class="stat-value" id="season-countdown">-</div>
+      </div>
+      <div class="stat-card gold">
+        <div class="stat-label" id="gs-top-label">Top LP</div>
+        <div class="stat-value" id="gs-top-lp">-</div>
+      </div>
+    </div>
+    <div class="table-wrap" id="lb-table">
+      <div class="loading">Loading leaderboard...</div>
+    </div>
+  </div>
+
+  <!-- match log -->
+  <div class="view" id="view-matches">
+    <div class="section-header">
+      <div class="header-row">
+        <div class="section-header flush">
+          <div class="section-title">Match Log</div>
+          <div class="section-sub" id="matches-updated"></div>
+        </div>
+        <button class="btn-ghost" data-action="refresh-matches">↻ Refresh</button>
+      </div>
+    </div>
+    <div class="table-wrap" id="matches-table">
+      <div class="loading">Loading matches...</div>
+    </div>
+    <div class="pagination" id="matches-pagination"></div>
+  </div>
+
+  <!-- weapons -->
+  <div class="view" id="view-weapons">
+    <div class="section-header">
+      <div>
+        <div class="section-title">Weapons</div>
+        <div class="section-sub" id="weapons-sub">Loading...</div>
+      </div>
+      <div class="season-toggle" id="weapon-mode-toggle">
+        <button class="active" data-action="weapon-mode" data-value="both">Both In Range</button>
+        <button data-action="weapon-mode" data-value="opponent">Opponent In Range</button>
+      </div>
+    </div>
+    <div id="weapon-controls"></div>
+    <div id="weapon-scatter"></div>
+    <div id="weapon-players"></div>
+    <div class="table-wrap" id="weapons-table">
+      <div class="loading">Loading weapon stats...</div>
+    </div>
+  </div>
+
+  <!-- player search -->
+  <div class="view" id="view-search">
+    <div class="section-header">
+      <div class="section-title">Player Search</div>
+    </div>
+    <div class="search-wrap">
+      <input class="search-input" id="search-input" type="text" placeholder="ENTER PLAYER NAME" autocomplete="off">
+      <div id="search-suggestions" class="suggestions" hidden></div>
+    </div>
+    <div id="search-error"></div>
+    <div id="player-profile"></div>
+  </div>
+
+  <!-- heat map -->
+  <div class="view" id="view-activity">
+    <div id="activity-heatmap-container"></div>
+  </div>
+</main>
+
+</body>
+</html>
