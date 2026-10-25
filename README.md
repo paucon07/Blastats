@@ -4,7 +4,7 @@ Match tracking and stats for [Blaston](https://www.resolutiongames.com/blaston),
 
 The same client also runs a 24/7 YouTube livestream of the matches, and every recorded match on the site links to when it happened on the stream.
 
-Live at [blastats.com](https://blastats.com). Stream at [YouTube](https://youtube.com/@CHANNEL).
+Live at [blastats.com](https://blastats.com). Stream at [YouTube](https://www.youtube.com/@xyfume/streams).
 
 ![Blastats opening page](docs/screenshot.png)
 
@@ -25,9 +25,9 @@ flowchart LR
 
 There are two sources of match data, and the API merges them.
 
-- The mod runs inside the Blaston Spectator client, which is captured and streamed to YouTube around the clock. It joins the spectate queue, only watches matches where a player is above 1900 LP, and directs the camera so the stream follows the action. It also records everything the spectator view can see: loadouts, health at the end of each round, damage taken per weapon, a per hit damage timeline, grabs, ping and character portraits.
+- The mod runs inside the Blaston Spectator client, which is captured and streamed to YouTube around the clock. It spectates competitive queue, and records everything the spectator view can see: loadouts, health at the end of each round, damage taken per weapon, a per hit damage timeline, grabs, ping and character portraits.
 - The poller talks to the game's backend directly. It tracks the season leaderboards and player stats, and picks up every ranked match announcement, not just the ones the mod is spectating. It works out the winner by watching each player's lifetime rounds won counter change.
-- The API pairs spectated matches with the poller's announcements (same players, within 3 minutes), applies result corrections, and serves the site.
+- The API pairs spectated matches with the poller's announcements, applies result corrections, and serves the site.
 
 ## Components
 
