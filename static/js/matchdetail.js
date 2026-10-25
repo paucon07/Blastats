@@ -25,12 +25,12 @@ function frostbyteFromEvents(round, receiverNetworkId, oppHadFrostbyte) {
   return frost;
 }
 
-// true if frostbyte is in the players deck or loadout
+// true if frostbyte is in the players loadout
 function playerHasFrostbyte(player) {
   if (!player) return false;
   const has = arr => Array.isArray(arr) && arr.some(
     w => w && typeof w.name === 'string' && w.name.toLowerCase() === 'frostbyte');
-  return has(player.deck) || has(player.weapons);
+  return has(player.weapons);
 }
 
 // one damage source chip

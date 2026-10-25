@@ -355,10 +355,9 @@ def _canon_weapon(k):
 def _is_weapon_source(key):
     return bool(key) and key.lower() not in NON_WEAPON_SOURCES
 
-# weapon list from weapons or deck
-# same check as the frontend
+# weapon list for a player
 def _ws_weapon_entries(pl):
-    return pl.get("weapons") or pl.get("deck") or []
+    return pl.get("weapons") or []
 
 # unique weapon display names for a player
 def _ws_loadout(pl):

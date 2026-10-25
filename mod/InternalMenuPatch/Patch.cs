@@ -716,42 +716,7 @@ public static class BlastonTracker
         return outp;
     }
 
-    // decks and characters
-    // read each players full 6 tool deck from the deck info lookup
-    private static void CaptureDecks(Il2CppIgnis.AutoSpectateScoreboardViewHandler handler, List<PlayerRecord> players)
-    {
-        try
-        {
-            var mdi = handler.matchDeckInfoData;
-            if (mdi == null || players == null) return;
-            var lookup = mdi.GetType().GetProperty("playerDeckInfoLookup", F)?.GetValue(mdi);
-            if (lookup == null) return;
-
-            var lt = lookup.GetType();
-            var getItem = lt.GetMethod("get_Item");
-            foreach (var k in EnumerateAny(lt.GetProperty("Keys")?.GetValue(lookup), 4))
-            {
-                int pid;
-                if (!int.TryParse(Describe(k), out pid)) continue;
-                var pr = players.FirstOrDefault(x => x.NetworkId == pid);
-                if (pr == null) continue;
-
-                var list = getItem?.Invoke(lookup, new[] { k });
-                var deck = new List<WeaponRecord>();
-                foreach (var ts in EnumerateAny(list, 12))
-                {
-                    if (ts == null) continue;
-                    var tt = ts.GetType();
-                    string name = tt.GetProperty("toolName")?.GetValue(ts)?.ToString() ?? "";
-                    string att = tt.GetProperty("toolAttachment")?.GetValue(ts)?.ToString() ?? "";
-                    if (name != "") deck.Add(new WeaponRecord { Name = name, Attachment = att == "Default" ? "" : att });
-                }
-                if (deck.Count > 0) pr.Deck = deck;
-            }
-        }
-        catch (Exception e) { Log($"deck capture error: {e.Message}"); }
-    }
-
+    // characters
     // health bar sprite name to character id, built once
     private static Dictionary<string, string> spriteToCharacter = null;
 
@@ -928,11 +893,10 @@ public static class BlastonTracker
 
                 var scoreboard = GetScoreboardReference();
 
-                // full decks and character names once the roster is known
+                // character names once the roster is known
                 if (currentMatch.Players.Count == 2)
                 {
                     BuildCharacterMap();
-                    if (currentMatch.Players.All(p => p.Deck == null)) CaptureDecks(handler, currentMatch.Players);
                 }
 
                 // weapons shown on the scoreboard
@@ -1302,10 +1266,7 @@ public static class BlastonTracker
                 string charJson = !string.IsNullOrEmpty(p.Character) ? $", \"character\": \"{J(p.Character)}\"" : "";
                 if (!string.IsNullOrEmpty(p.CharacterName)) charJson += $", \"characterName\": \"{J(p.CharacterName)}\"";
                 charJson += $", \"isHost\": {(p.NetworkId == 1 ? "true" : "false")}";
-                string deckJson = p.Deck != null && p.Deck.Count > 0
-                    ? ", \"deck\": [" + string.Join(",", p.Deck.Select(w => $"{{\"name\":\"{J(w.Name)}\",\"attachment\":\"{J(w.Attachment)}\"}}")) + "]"
-                    : "";
-                sb.AppendLine($"    {{\"displayName\": \"{J(p.DisplayName)}\", \"leaguePoints\": {p.LeaguePoints}, \"characterId\": {p.CharacterId}{charJson}, \"networkId\": {p.NetworkId}{pingJson}, \"weapons\": [{weaponsJson}]{deckJson}}}{comma}");
+                sb.AppendLine($"    {{\"displayName\": \"{J(p.DisplayName)}\", \"leaguePoints\": {p.LeaguePoints}, \"characterId\": {p.CharacterId}{charJson}, \"networkId\": {p.NetworkId}{pingJson}, \"weapons\": [{weaponsJson}]}}{comma}");
             }
             sb.AppendLine("  ],");
 
@@ -1421,7 +1382,6 @@ public static class BlastonTracker
         public int CharacterId;
         public string Character; // portrait sprite name
         public string CharacterName; // resolved character id
-        public List<WeaponRecord> Deck; // full 6 tool deck
         public int Ping = -1; // averaged ms, -1 is unknown
         public long PingSum = 0;
         public int PingSamples = 0;
