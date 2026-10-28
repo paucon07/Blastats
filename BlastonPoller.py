@@ -4,15 +4,15 @@ import os
 import time
 from datetime import datetime, timezone
 
-import rectify  # local match rectifier that writes data corrections json
+import db
+import rectify  # local match rectifier that writes corrections to the database
+import store
 
 # file paths
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-LEADERBOARD_FILE = os.path.join(DATA_DIR, "leaderboard.json")
-PLAYERS_FILE = os.path.join(DATA_DIR, "players.json")
+DATA_DIR = db.DATA_DIR
 LOG_FILE = os.path.join(DATA_DIR, "poller.log")
-SEASON_FILE = os.path.join(DATA_DIR, "season.json")
-ALL_MATCHES_FILE = os.path.join(DATA_DIR, "all_matches.json")
+# written by the mod and read here to pick up spectated matches
+MATCHES_FILE = os.path.join(DATA_DIR, "matches.json")
 
 # playfab title and poll intervals in seconds
 PLAYFAB_TITLE_ID = "B0549"
@@ -82,22 +82,50 @@ def load_json(path, default):
             except json.JSONDecodeError: return default
     return default
 
-# write to a temp file then swap it in
-# readers never see a half written file
-def save_json(path, data):
-    # temp name per process so nothing clashes
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    # windows blocks the swap while a reader has the file open so retry briefly
-    for attempt in range(5):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            if attempt == 4:
-                raise
-            time.sleep(0.1)
+# database
+# one connection opened in main and shared by everything here
+conn = None
+
+# player fields that are timestamps and their database columns
+PLAYER_TIMES = {"firstSeen": "first_seen", "lastSeen": "last_seen", "accountCreated": "account_created",
+                "accountCheckedAt": "account_checked_at", "statsLastUpdated": "stats_updated_at",
+                "statsBackfilledAt": "stats_backfilled_at"}
+
+# players keyed by playfab id in the same shape the old json file had
+# so the stat and ladder code below works on a plain dict
+def load_players():
+    players = {}
+    for r in conn.execute("SELECT * FROM players ORDER BY rowid"):
+        p = {"displayName": r["display_name"], "playFabId": r["player_id"], "source": r["source"], "stats": {}}
+        for key, col in PLAYER_TIMES.items():
+            if r[col] is not None:
+                p[key] = r[col]
+        players[r["player_id"]] = p
+    for s in conn.execute("SELECT * FROM player_stats"):
+        players[s["player_id"]]["stats"][s["stat_name"]] = s["value"]
+    return players
+
+# write every player and their stats back in one transaction
+# first seen is never overwritten once a player exists
+def save_players(players):
+    rows, stats = [], []
+    for pfid, p in players.items():
+        times = {col: db.norm_ts(p.get(key)) for key, col in PLAYER_TIMES.items()}
+        first = times["first_seen"] or db.now_iso()
+        rows.append((pfid, p.get("displayName") or "", p.get("source") or "unknown", first,
+                     times["last_seen"] or first, times["account_created"], times["account_checked_at"],
+                     times["stats_updated_at"], times["stats_backfilled_at"]))
+        stats += [(pfid, name, value) for name, value in (p.get("stats") or {}).items() if value is not None]
+    with conn:
+        conn.executemany("""
+            INSERT INTO players VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (player_id) DO UPDATE SET
+                display_name = excluded.display_name, source = excluded.source, last_seen = excluded.last_seen,
+                account_created = excluded.account_created, account_checked_at = excluded.account_checked_at,
+                stats_updated_at = excluded.stats_updated_at, stats_backfilled_at = excluded.stats_backfilled_at
+        """, rows)
+        conn.executemany("INSERT INTO player_stats VALUES (?, ?, ?) "
+                         "ON CONFLICT (player_id, stat_name) DO UPDATE SET value = excluded.value", stats)
 
 # auth
 session_ticket = None
@@ -222,7 +250,7 @@ def find_pfid_by_name(players_db, display_name):
 
 # look up a player by display name then fetch their stat
 def fetch_stat_for_player_by_name(display_name, stat_name):
-    pfid = find_pfid_by_name(load_json(PLAYERS_FILE, {}), display_name)
+    pfid = find_pfid_by_name(load_players(), display_name)
     if not pfid:
         return None
     return fetch_stat_by_pfid(pfid, stat_name)
@@ -267,7 +295,7 @@ def poll_recent_matches():
 
     announcements = response.json().get("recent_announcements", [])
     # load tracked players once for the whole batch
-    players_db = load_json(PLAYERS_FILE, {})
+    players_db = load_players()
 
     for match in announcements:
         # skip matches already tracked or handled
@@ -407,16 +435,10 @@ def poll_ongoing_matches():
         del ongoing_matches[match_id]
 
 
-# append a finished match to the matches file
+# save a finished match to the database
+# joins the spectated copy if the mod already saved it
 def save_match_from_announcement(match, winner, score, p1_won, p2_won):
     try:
-        existing = load_json(ALL_MATCHES_FILE, [])
-
-        # skip if already saved
-        if any(e.get("match_id") == match["match_id"] for e in existing):
-            log(f"match {match['match_id'][:8]} already saved, skipping")
-            return
-
         # guess round order from the totals
         round_winners = []
         p1_remaining = p1_won
@@ -447,21 +469,21 @@ def save_match_from_announcement(match, winner, score, p1_won, p2_won):
             "roundWinners": round_winners,
             "source": "announcement"
         }
-        existing.append(entry)
-        save_json(ALL_MATCHES_FILE, existing)
+        # rolled back if it cant be saved
+        with conn:
+            store.add_announcement(conn, entry)
+    except store.Skip as e:
+        log(f"match {match['match_id'][:8]} not saved: {e}")
     except Exception as e:
         log(f"save_match_from_announcement error: {e}")
 
 # season reset detection
-# clear current season lp if the season version changed
-def check_season_reset(current_version, players_db):
-    stored = load_json(SEASON_FILE, {})
-    last_version = stored.get("version")
-    if last_version and last_version != current_version:
+# season lp is read from the ladder rows so nothing needs clearing
+def check_season_reset(current_version):
+    row = conn.execute("SELECT version FROM seasons WHERE status = 'current'").fetchone()
+    last_version = row[0] if row else None
+    if last_version and current_version and last_version != current_version:
         log(f"Season reset detected! {last_version} -> {current_version}")
-        for player in players_db.values():
-            player["currentSeasonLP"] = None
-            player["currentSeasonPosition"] = None
         return True
     return False
 
@@ -481,71 +503,78 @@ def poll_leaderboard():
 
     current = result.get("currentSeason", {})
     previous = result.get("previousSeason", {})
+    current_version = str(current["version"]) if current.get("version") is not None else None
+    check_season_reset(current_version)
 
-    # save the raw ladders
-    save_json(LEADERBOARD_FILE, {
-        "lastUpdated": datetime.now(timezone.utc).isoformat(),
-        "currentSeason": {"version": current.get("version"), "leaderboard": current.get("leaderboard", [])},
-        "previousSeason": {"version": previous.get("version"), "leaderboard": previous.get("leaderboard", [])}
-    })
-
-    players_db = load_json(PLAYERS_FILE, {})
-    # clear out old history lists
-    # charts are built from matches instead
-    for p in players_db.values():
-        p.pop("history", None)
-    if check_season_reset(current.get("version"), players_db):
-        save_json(PLAYERS_FILE, players_db)
-
-    # remember the season version for next time
-    save_json(SEASON_FILE, {"version": current.get("version"), "snapshotTime": datetime.now(timezone.utc).isoformat()})
-
-    update_players_from_leaderboard(players_db, current.get("leaderboard", []), "current")
-    update_players_from_leaderboard(players_db, previous.get("leaderboard", []), "previous")
-    save_json(PLAYERS_FILE, players_db)
+    # players first so every ladder row can link to one
+    players_db = load_players()
+    update_players_from_leaderboard(players_db, current.get("leaderboard", []))
+    update_players_from_leaderboard(players_db, previous.get("leaderboard", []))
+    save_players(players_db)
+    save_ladders(current, previous)
     log(f"Leaderboard saved: {len(current.get('leaderboard', []))} current, {len(previous.get('leaderboard', []))} previous")
 
-# add new players and update lp and position from a ladder
-def update_players_from_leaderboard(players_db, leaderboard, season):
+# add new players from a ladder and update their names
+def update_players_from_leaderboard(players_db, leaderboard):
     new_count = 0
+    now = db.now_iso()
     for entry in leaderboard:
         name = entry.get("displayName", "Unknown")
         pfid = entry.get("playFabMasterPlayerId")
-        lp = entry.get("value", 0)
-        position = entry.get("position", 0) + 1  # server ranks start at 0
         if name == "Unknown" or not pfid:
             continue
         # new player
         if pfid not in players_db:
             players_db[pfid] = {
                 "displayName": name, "playFabId": pfid,
-                "firstSeen": datetime.now(timezone.utc).isoformat(),
-                "lastSeen": datetime.now(timezone.utc).isoformat(),
+                "firstSeen": now, "lastSeen": now,
                 "source": "leaderboard", "stats": {}
             }
             new_count += 1
         p = players_db[pfid]
-        p["lastSeen"] = datetime.now(timezone.utc).isoformat()
+        p["lastSeen"] = now
         p["displayName"] = name
-        # store lp under the right season
-        if season == "current":
-            p["currentSeasonLP"] = lp
-            p["currentSeasonPosition"] = position
-        else:
-            p["previousSeasonLP"] = lp
-            p["previousSeasonPosition"] = position
     if new_count > 0:
         log(f"Discovered {new_count} new players")
+
+# replace both season ladders and mark which season is current and previous
+def save_ladders(current, previous):
+    now = db.now_iso()
+    known = {r[0] for r in conn.execute("SELECT player_id FROM players")}
+    seen = set()
+    with conn:
+        # only one season can hold each status so they are cleared first
+        conn.execute("UPDATE seasons SET status = NULL")
+        for status, season in (("current", current), ("previous", previous)):
+            if season.get("version") is None or str(season["version"]) in seen:
+                continue
+            version = str(season["version"])
+            seen.add(version)
+            conn.execute("INSERT INTO seasons VALUES (?, ?, ?, ?) ON CONFLICT (version) "
+                         "DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at",
+                         (version, now, status, now))
+            conn.execute("DELETE FROM leaderboard_entries WHERE season_version = ?", (version,))
+            positions = set()
+            for e in season.get("leaderboard", []):
+                # server ranks start at 0
+                position = e.get("position", 0) + 1
+                if position in positions:
+                    continue
+                positions.add(position)
+                pfid = e.get("playFabMasterPlayerId")
+                conn.execute("INSERT INTO leaderboard_entries VALUES (?, ?, ?, ?, ?, ?, ?)", (
+                    version, position, pfid if pfid in known else None, e.get("displayName") or "Unknown",
+                    e.get("value", 0), e.get("secondaryValue"), e.get("formattedValue")))
 
 # update tracked player stats from each stat ladder
 def refresh_all_stats(max_pages=30):
     ensure_auth()
-    players_db = load_json(PLAYERS_FILE, {})
+    players_db = load_players()
 
     # players with a real playfab id
     tracked = {pfid for pfid, p in players_db.items()
                if p.get("playFabId") and not pfid.startswith("name:")}
-    now = datetime.now(timezone.utc).isoformat()
+    now = db.now_iso()
     touched = set()  # players updated this cycle
     missing_by_stat = {}  # stat name to tracked players not on the ladder
 
@@ -653,14 +682,14 @@ def refresh_all_stats(max_pages=30):
 
     # only save if something changed
     if touched:
-        save_json(PLAYERS_FILE, players_db)
+        save_players(players_db)
     log(f"refresh_all_stats complete: {len(touched)} players updated")
 
 # fetch account creation dates once per player
 # failed lookups retry once per recheck interval
 def backfill_account_ages(max_calls=ACCOUNT_AGE_MAX_CALLS):
-    players_db = load_json(PLAYERS_FILE, {})
-    now_iso = datetime.now(timezone.utc).isoformat()
+    players_db = load_players()
+    now_iso = db.now_iso()
     now_ts = time.time()
 
     # needs a date and wasnt checked recently
@@ -691,9 +720,46 @@ def backfill_account_ages(max_calls=ACCOUNT_AGE_MAX_CALLS):
         time.sleep(0.15)
 
     if calls:
-        save_json(PLAYERS_FILE, players_db)
+        save_players(players_db)
         log(f"account age backfill: {got}/{calls} fetched "
             f"({len(pending)} pending, cap {max_calls})")
+
+# spectated matches
+# the mod still writes matches json so new entries are copied into the database
+# file mtime when it was last read
+matches_mtime = None
+# end time of the newest spectated match already copied
+last_spectated = None
+
+def ingest_spectated():
+    global matches_mtime, last_spectated
+    if not os.path.exists(MATCHES_FILE):
+        return
+    mtime = os.path.getmtime(MATCHES_FILE)
+    if mtime == matches_mtime:
+        return
+    mods = load_json(MATCHES_FILE, None)
+    # the mod rewrites the whole file so a half written one is read again next loop
+    if not isinstance(mods, list):
+        return
+    if last_spectated is None:
+        last_spectated = conn.execute("SELECT MAX(ended_at) FROM matches WHERE spectated = 1").fetchone()[0] or ""
+
+    # the mod appends in the order matches end so only newer ones need looking at
+    for m in mods:
+        ended = db.norm_ts(m.get("matchEndTime"))
+        if not ended or ended <= last_spectated:
+            continue
+        names = " vs ".join(p.get("displayName", "?") for p in m.get("players", []))
+        try:
+            # rolled back if it cant be saved
+            with conn:
+                store.add_spectated(conn, m)
+            log(f"spectated match saved: {names}")
+        except store.Skip as e:
+            log(f"spectated match {names} not saved: {e}")
+        last_spectated = ended
+    matches_mtime = mtime
 
 # run the full stats update
 def poll_player_stats():
@@ -704,8 +770,14 @@ def poll_player_stats():
 
 # main
 def main():
+    global conn
     os.makedirs(DATA_DIR, exist_ok=True)
     log("Blaston Poller Starting!")
+    conn = db.connect()
+    # history from before the switch has to be imported first
+    if not conn.execute("SELECT 1 FROM matches LIMIT 1").fetchone() and \
+            os.path.exists(os.path.join(DATA_DIR, "all_matches.json")):
+        log("Database has no matches yet, run import_json.py first to bring over the json history")
     # cant do anything without a login
     if not authenticate():
         log("Auth failed, exiting")
@@ -740,8 +812,8 @@ def main():
             except Exception as e: log(f"Stats error: {e}")
             # rerun the rectifier on the fresh elo
             try:
-                n = rectify.rectify(DATA_DIR)
-                log(f"rectify: {n} auto-corrections in corrections.json")
+                n = rectify.rectify()
+                log(f"rectify: {n} auto-corrections saved")
             except Exception as e: log(f"rectify error: {e}")
             last_player_stats = now
 
@@ -750,6 +822,10 @@ def main():
             try: poll_recent_matches()
             except Exception as e: log(f"recent matches error: {e}")
             last_recent_poll = now
+
+        # spectated matches whenever the mod writes a new one
+        try: ingest_spectated()
+        except Exception as e: log(f"spectated matches error: {e}")
 
         # sleep less while matches are live
         time.sleep(3 if ongoing_matches else 10)

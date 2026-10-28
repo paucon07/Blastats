@@ -2,10 +2,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from typing import Literal
-import json, os, traceback
+import json, os, sqlite3, threading, traceback
+
+import db
 
 
 # app setup
@@ -23,17 +26,11 @@ async def no_cache_frontend(request, call_next):
     return response
 
 # file paths
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+DATA_DIR = db.DATA_DIR
 ICONS_DIR = os.path.join(DATA_DIR, "icons")
 AVATARS_DIR = os.path.join(DATA_DIR, "avatars")
-LEADERBOARD_FILE = os.path.join(DATA_DIR, "leaderboard.json")
-PLAYERS_FILE = os.path.join(DATA_DIR, "players.json")
-MATCHES_FILE = os.path.join(DATA_DIR, "matches.json")
-ALL_MATCHES_FILE = os.path.join(DATA_DIR, "all_matches.json")
-CORRECTIONS_FILE = os.path.join(DATA_DIR, "corrections.json")
+# stream info stays a file since it is edited by hand
 STREAM_FILE = os.path.join(DATA_DIR, "stream_info.json")
-TOURNAMENTS_FILE = os.path.join(DATA_DIR, "tournaments.json")
-WEAPON_FACTS_FILE = os.path.join(DATA_DIR, "weapon_facts_cache.json")
 # frontend files only
 # keeps code and data off the public site
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -46,15 +43,6 @@ def load_json(path, default):
             try: return json.load(f)
             except json.JSONDecodeError: return default
     return default
-
-# write to a temp file then swap it in
-# readers never see a half written file
-def save_json(path, data):
-    # temp name per process so workers dont clash
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-    os.replace(tmp, path)
 
 # path to data and file mtime
 _cache = {}
@@ -75,251 +63,206 @@ def load_json_cached(path, default):
     _cache[path] = (data, mtime)
     return data
 
-# mtimes of both match files
-# used as the cache key for merges and weapon facts
-def _match_files_key():
-    matches_mtime = os.path.getmtime(MATCHES_FILE) if os.path.exists(MATCHES_FILE) else 0
-    all_mtime = os.path.getmtime(ALL_MATCHES_FILE) if os.path.exists(ALL_MATCHES_FILE) else 0
-    return (matches_mtime, all_mtime)
-
-# one page of a list plus page info
+# page info for a list of total items
 # 1 to 100 per page and the page kept in range
-def _paginate(items, page, per_page):
+def _page(total, page, per_page):
     per_page = max(1, min(per_page, 100))
-    total = len(items)
     total_pages = max(1, (total + per_page - 1) // per_page)
     page = max(1, min(page, total_pages))
-    start = (page - 1) * per_page
-    return {
-        "matches": items[start:start + per_page],
-        "page": page,
-        "perPage": per_page,
-        "totalPages": total_pages,
-        "total": total,
-    }
+    return {"page": page, "perPage": per_page, "totalPages": total_pages, "total": total}
 
-# players dict the name index was built from
-_name_index_src = None
-_name_index = {}
+# database
+# one connection per request since a connection cant be shared between threads
+@contextmanager
+def open_db():
+    conn = db.connect()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+# one long lived connection only used to notice writes from the poller
+# data version changes whenever another connection commits
+_watch = None
+_watch_lock = threading.Lock()
+_watch_version = None
+_generation = 0
+
+# number that goes up every time the database changes
+# used as the key for the in memory caches
+def data_generation():
+    global _watch, _watch_version, _generation
+    with _watch_lock:
+        if _watch is None:
+            # make sure the file and tables exist first
+            db.connect().close()
+            _watch = sqlite3.connect(db.DB_FILE, check_same_thread=False)
+        version = _watch.execute("PRAGMA data_version").fetchone()[0]
+        if version != _watch_version:
+            _watch_version = version
+            _generation += 1
+        return _generation
+
+# one page of ids from a query that selects ids first plus the page info
+def _paged_ids(conn, sql, params, page, per_page):
+    total = conn.execute(f"SELECT COUNT(*) FROM ({sql})", params).fetchone()[0]
+    info = _page(total, page, per_page)
+    offset = (info["page"] - 1) * info["perPage"]
+    ids = [r[0] for r in conn.execute(f"{sql} LIMIT ? OFFSET ?", (*params, info["perPage"], offset))]
+    return ids, info
+
+# players
+# players with their season lp from the ladders
+PLAYERS_SQL = """
+SELECT p.*, s.current_season_lp, s.current_season_position,
+    s.previous_season_lp, s.previous_season_position
+FROM players p JOIN v_player_standings s ON s.player_id = p.player_id
+"""
+
+# player row and stats in the same shape as the old players json
+def player_dict(row, stats):
+    p = {"displayName": row["display_name"], "playFabId": row["player_id"],
+         "firstSeen": row["first_seen"], "lastSeen": row["last_seen"],
+         "source": row["source"], "stats": stats}
+    # optional values only appear when set like before
+    for key, col in (("currentSeasonLP", "current_season_lp"), ("currentSeasonPosition", "current_season_position"),
+                     ("previousSeasonLP", "previous_season_lp"), ("previousSeasonPosition", "previous_season_position"),
+                     ("accountCreated", "account_created"), ("accountCheckedAt", "account_checked_at"),
+                     ("statsLastUpdated", "stats_updated_at"), ("statsBackfilledAt", "stats_backfilled_at")):
+        if row[col] is not None:
+            p[key] = row[col]
+    return p
 
 # find a player by name ignoring case or none
-# index is rebuilt only when players json reloads
-def find_player(players, name):
-    global _name_index_src, _name_index
-    if players is not _name_index_src:
-        _name_index = {(p.get("displayName") or "").lower(): p for p in players.values()}
-        _name_index_src = players
-    return _name_index.get(name.lower())
+# the most recently added account wins when names are shared like before
+def find_player(conn, name):
+    row = conn.execute(PLAYERS_SQL + "WHERE p.display_name = ? COLLATE NOCASE ORDER BY p.rowid DESC LIMIT 1",
+                       (name,)).fetchone()
+    if row is None:
+        return None
+    stats = {s["stat_name"]: s["value"] for s in conn.execute(
+        "SELECT stat_name, value FROM player_stats WHERE player_id = ?", (row["player_id"],))}
+    return player_dict(row, stats)
 
-# match validation
-# check a match is a real best of 3 result
-def is_valid_match(match):
-    players = match.get("players", [])
-    winner = match.get("winner", "")
-    round_winners = match.get("roundWinners", [])
-    # needs 2 players and a winner
-    if len(players) != 2 or not winner:
-        return False
-    # 2 or 3 rounds only
-    n = len(round_winners)
-    if n < 2 or n > 3:
-        return False
-    # winner took exactly 2 and loser at most 1
-    # filters old 4 round rows from the poller
-    winner_rounds = sum(1 for r in round_winners if (r or "").lower() == winner.lower())
-    return winner_rounds == 2 and (n - winner_rounds) <= 1
+# a players matches from their side newest first
+# one row per match even when both sides share the name
+# takes the name twice
+PLAYER_MATCHES_SQL = """
+SELECT pm.* FROM v_player_matches pm
+WHERE pm.display_name = ? COLLATE NOCASE
+AND pm.slot = (SELECT MIN(x.slot) FROM match_players x
+               WHERE x.match_id = pm.match_id AND x.display_name = ? COLLATE NOCASE)
+ORDER BY pm.started_at DESC, pm.match_id DESC
+"""
+# same query returning only the match ids
+PLAYER_MATCH_IDS_SQL = PLAYER_MATCHES_SQL.replace("SELECT pm.*", "SELECT pm.match_id", 1)
 
-# merged match list before corrections
-_merged_cache = None
-# match file mtimes the merged list was built from
-_merged_cache_key = None
+# matches
+# full matches in the same shape the old merged list had
+# corrections are already applied by the views
+def build_matches(conn, ids):
+    if not ids:
+        return []
+    marks = ",".join("?" * len(ids))
+    rows = {r["id"]: r for r in conn.execute(f"SELECT * FROM v_matches WHERE id IN ({marks})", ids)}
 
-# on disk copy of the merged list
-# old merged cache file is ignored since the format changed
-MERGED_CACHE_FILE = os.path.join(DATA_DIR, "merged_base_cache.json")
+    players = defaultdict(list)
+    for p in conn.execute(f"SELECT * FROM match_players WHERE match_id IN ({marks}) ORDER BY match_id, slot", ids):
+        players[p["match_id"]].append(p)
+    weapons = defaultdict(list)
+    for w in conn.execute(f"SELECT * FROM match_loadouts WHERE match_id IN ({marks}) "
+                          "ORDER BY match_id, slot, position", ids):
+        weapons[(w["match_id"], w["slot"])].append({"name": w["weapon"], "attachment": w["attachment"] or ""})
+    rounds = defaultdict(list)
+    for r in conn.execute(f"SELECT * FROM v_rounds WHERE match_id IN ({marks}) ORDER BY match_id, round_number", ids):
+        rounds[r["match_id"]].append(r)
+    # damage and grab totals by round then receiver then type then source
+    stats = defaultdict(dict)
+    for s in conn.execute(f"SELECT * FROM round_stats WHERE match_id IN ({marks})", ids):
+        by_receiver = stats[(s["match_id"], s["round_number"])].setdefault(s["receiver_slot"], {})
+        by_receiver.setdefault(s["stat_type"], {})[s["source"]] = s["value"]
+    events = defaultdict(list)
+    for e in conn.execute(f"SELECT * FROM round_events WHERE match_id IN ({marks}) "
+                          "ORDER BY match_id, round_number, seq", ids):
+        events[(e["match_id"], e["round_number"])].append(e)
 
-# corrections file contents and its mtime
-_corr_cache = None
-_corr_cache_mtime = -1
-
-# read corrections only when the file changes
-# poller rewrites it every stats cycle
-def load_corrections_cached():
-    global _corr_cache, _corr_cache_mtime
-    mtime = _mtime(CORRECTIONS_FILE)
-    if _corr_cache is None or mtime != _corr_cache_mtime:
-        _corr_cache = load_json(CORRECTIONS_FILE, {})
-        _corr_cache_mtime = mtime
-    return _corr_cache
-
-# corrections
-# apply winner flips and exclusions on top of the matches
-# data files are never changed
-# rectify writes the corrections file
-# hand added entries need source manual so rectify keeps them
-def apply_corrections(matches):
-    corr = load_corrections_cached()
-    if not corr:
-        return matches
     out = []
-    for m in matches:
-        # never correct a spectated match
-        # it can share a match id with a corrected poller row
-        if m.get("spectated"):
-            out.append(m)
+    for mid in ids:
+        m = rows.get(mid)
+        # excluded since the ids were picked
+        if m is None:
             continue
-        c = corr.get(m.get("match_id"))
-        # no correction for this match
-        if not c:
-            out.append(m)
+        ps = players[mid]
+        # a match always has two players so anything else is skipped not crashed on
+        if len(ps) != 2:
             continue
-        # drop the match
-        if c.get("exclude"):
+        names = [p["display_name"] for p in ps]
+        network_ids = [p["network_id"] for p in ps]
+        spectated = bool(m["spectated"])
+
+        match = {"timestamp": m["started_at"], "winner": names[m["winner_slot"]], "score": m["score"],
+                 "roundCount": m["round_count"], "players": [],
+                 "roundWinners": [names[r["winner_slot"]] for r in rounds[mid]], "spectated": spectated}
+        match_id = m["spectate_id"] if spectated else m["announcement_id"]
+        if match_id:
+            match["match_id"] = match_id
+        if m["corrected"]:
+            match["corrected"] = True
+
+        for p in ps:
+            player = {"displayName": p["display_name"], "leaguePoints": p["league_points"]}
+            if p["elo"] is not None:
+                player["elo"] = p["elo"]
+            if p["rounds_start"] is not None:
+                player["roundsStart"] = p["rounds_start"]
+            if spectated:
+                for key, col in (("characterId", "character_id"), ("character", "character"),
+                                 ("characterName", "character_name"), ("networkId", "network_id"), ("ping", "ping")):
+                    if p[col] is not None:
+                        player[key] = p[col]
+                if p["network_id"] is not None:
+                    player["isHost"] = p["network_id"] == 1
+                player["weapons"] = weapons[(mid, p["slot"])]
+            match["players"].append(player)
+
+        if not spectated:
+            match["source"] = "announcement"
+            out.append(match)
             continue
-        old_w = m.get("winner") or ""
-        names = [p.get("displayName") for p in m.get("players", [])]
-        # new winner must be one of the two players
-        # also fixes the name casing
-        new_w = next((n for n in names if n and n.lower() == (c.get("winner") or "").lower()), None)
-        if new_w and new_w.lower() != old_w.lower():
-            other = next((n for n in names if n and n.lower() != new_w.lower()), None)
-            # swap every round winner to match
-            rw = [new_w if (r or "").lower() == old_w.lower() else other
-                  for r in m.get("roundWinners", [])]
-            m = {**m, "winner": new_w, "roundWinners": rw, "corrected": True}
-        out.append(m)
+
+        for key, col in (("matchEndTime", "ended_at"), ("endReason", "end_reason"), ("region", "region")):
+            if m[col] is not None:
+                match[key] = m[col]
+        # round detail only exists on newer spectated matches
+        match["rounds"] = []
+        detail = []
+        for r in rounds[mid]:
+            n = r["round_number"]
+            rnd = {"round": n, "winner": names[r["winner_slot"]]}
+            if r["duration_seconds"] is not None:
+                rnd["durationSeconds"] = r["duration_seconds"]
+            if r["forfeit_slot"] is not None:
+                rnd["endedByForfeit"] = True
+                rnd["forfeitPlayerId"] = network_ids[r["forfeit_slot"]]
+            if r["slot0_health"] is not None:
+                rnd["p1Health"] = r["slot0_health"]
+            if r["slot1_health"] is not None:
+                rnd["p2Health"] = r["slot1_health"]
+            # keyed by network id like the mod writes it
+            if stats.get((mid, n)):
+                rnd["stats"] = {str(network_ids[slot]): by_type for slot, by_type in stats[(mid, n)].items()}
+            if events.get((mid, n)):
+                rnd["events"] = [{"t": e["t"], "weapon": e["weapon"], "receiver": network_ids[e["receiver_slot"]],
+                                  "dmg": e["dmg"]} for e in events[(mid, n)]]
+            detail.append(rnd)
+        if any(len(rnd) > 2 for rnd in detail):
+            match["rounds"] = detail
+        out.append(match)
     return out
-
-
-# merging
-# full match list newest first with corrections applied
-def merge_matches():
-    # slow merge is cached on match file mtimes only
-    base = _build_base_merged(_match_files_key())
-    # corrections are cheap so apply every request
-    return apply_corrections(base)
-
-
-# pair spectated matches with poller announcements
-# cached in memory and on disk
-def _build_base_merged(base_key):
-    global _merged_cache, _merged_cache_key
-
-    # match files unchanged so reuse the memory copy
-    if _merged_cache is not None and _merged_cache_key == base_key:
-        return _merged_cache
-
-    # newest match file change
-    source_key = max(base_key)
-
-    # disk copy is newer than both match files so reuse it
-    # shared across workers and restarts
-    cache_mtime = os.path.getmtime(MERGED_CACHE_FILE) if os.path.exists(MERGED_CACHE_FILE) else 0
-    if cache_mtime > source_key:
-        _merged_cache = load_json(MERGED_CACHE_FILE, [])
-        _merged_cache_key = base_key
-        return _merged_cache
-
-    # read fresh copies since the data changed
-    # cached reads could be stale
-    mod_matches = load_json(MATCHES_FILE, [])
-    all_matches = load_json(ALL_MATCHES_FILE, [])
-
-    # group announcements by player pair
-    ann_by_players = defaultdict(list)
-    for ann in all_matches:
-        try:
-            key = frozenset((p.get("displayName") or "").lower() for p in ann.get("players", []))
-            ann_time = datetime.fromisoformat(ann["timestamp"].replace("Z", "+00:00"))
-            ann_by_players[key].append((ann_time, ann))
-        except (ValueError, KeyError):
-            continue
-
-    # valid spectated matches oldest first
-    sorted_mods = sorted(
-        (m for m in mod_matches if is_valid_match(m)),
-        key=lambda m: m.get("timestamp", "")
-    )
-
-    merged = []
-    for mod_match in sorted_mods:
-        try:
-            mod_time = datetime.fromisoformat(mod_match["timestamp"].replace("Z", "+00:00"))
-        except (ValueError, KeyError):
-            # bad timestamp so keep it unpaired
-            merged.append({**mod_match, "spectated": True})
-            continue
-
-        key = frozenset((p.get("displayName") or "").lower() for p in mod_match.get("players", []))
-
-        # closest announcement for the same pair within 3 minutes
-        best_idx, best_dt = None, float("inf")
-        for i, (ann_time, _) in enumerate(ann_by_players[key]):
-            dt = abs((mod_time - ann_time).total_seconds())
-            if dt < 180 and dt < best_dt:
-                best_idx, best_dt = i, dt
-
-        if best_idx is not None:
-            # remove it so it cant pair twice
-            _, best_ann = ann_by_players[key].pop(best_idx)
-            # copy elo from the announcement
-            ann_elo: dict[str, object] = {
-                (p.get("displayName") or "").lower(): p.get("elo")
-                for p in best_ann.get("players", [])
-            }
-            # keep the player as is when the announcement has no elo
-            merged_players = []
-            for p in mod_match.get("players", []):
-                pname: str = (p.get("displayName") or "").lower()
-                elo = ann_elo.get(pname)
-                merged_players.append({**p, "elo": elo} if elo is not None else p)
-            # use the announcement timestamp
-            merged_match = {**mod_match, "timestamp": best_ann["timestamp"],
-                            "spectated": True, "players": merged_players}
-        else:
-            merged_match = {**mod_match, "spectated": True}
-        merged.append(merged_match)
-
-    # merged match times by player pair
-    merged_times_by_players = defaultdict(list)
-    for m in merged:
-        key = frozenset((p.get("displayName") or "").lower() for p in m.get("players", []))
-        try:
-            merged_times_by_players[key].append(
-                datetime.fromisoformat(m["timestamp"].replace("Z", "+00:00"))
-            )
-        except (ValueError, KeyError):
-            pass
-
-    # add leftover announcements as non spectated
-    for ann_key, ann_entries in ann_by_players.items():
-        for ann_time, ann in ann_entries:
-            # skip if a merged match is within 3 minutes
-            already = any(
-                abs((ann_time - mt).total_seconds()) < 180
-                for mt in merged_times_by_players[ann_key]
-            )
-            if not already:
-                merged.append({**ann, "spectated": False})
-
-    # newest first
-    # corrections are not baked in
-    result = sorted(merged, key=lambda m: m.get("timestamp") or "", reverse=True)
-
-    # save to memory and disk
-    _merged_cache = result
-    _merged_cache_key = base_key
-    # disk write failing just means a rebuild next time
-    try:
-        save_json(MERGED_CACHE_FILE, result)
-    except OSError as e:
-        print(f"merged cache write failed: {e}")
-
-    return result
 
 # weapon stats
 # weapon data is only on spectated matches
-# corrections never touch those so facts only depend on match file mtimes
+# corrections never touch those so facts only change when matches are added
 # damage is stored by receiver so dealt damage comes from the other side
 # throw and cage are not weapons
 # frostbyte throws logged as plain throw are undercounted
@@ -355,194 +298,92 @@ def _canon_weapon(k):
 def _is_weapon_source(key):
     return bool(key) and key.lower() not in NON_WEAPON_SOURCES
 
-# weapon list for a player
-def _ws_weapon_entries(pl):
-    return pl.get("weapons") or []
-
-# unique weapon display names for a player
-def _ws_loadout(pl):
-    seen = []
-    for w in _ws_weapon_entries(pl):
-        nm = w.get("name")
-        if not nm:
-            continue
-        nm = _canon_weapon(nm)
-        if nm not in seen:
-            seen.append(nm)
-    return seen
-
-# attachments on a player weapons
-def _ws_attachments(pl):
-    out = []
-    for w in _ws_weapon_entries(pl):
-        a = w.get("attachment")
-        if a:
-            out.append(a)
-    return out
-
-# player elo as a float or none
-def _ws_elo(pl):
-    e = pl.get("elo")
-    try:
-        return float(e) if e is not None else None
-    except (TypeError, ValueError):
-        return None
-
 # frostbyte throw hits are always 5 15 or 20
 # same check as the match detail view
 # only used when the dealer had frostbyte
-FROSTBYTE_THROW_DMG = {5, 15, 20}
+FROSTBYTE_THROW_DMG = (5, 15, 20)
 
-# frostbyte name as spelled in the loadout or none
-def _loadout_frostbyte_name(loadout):
-    for w in loadout:
-        if isinstance(w, str) and w.lower() == "frostbyte":
-            return w
-    return None
-
-# round half up like js
-# so 14 point 5 becomes 15 like the frontend
-def _js_round(x):
-    return int(x + 0.5)
-
-# total frostbyte throw damage a player received in a round
-def _frostbyte_throw_dmg(rnd, receiver_nid):
-    total = 0.0
-    rid = str(receiver_nid)
-    for e in (rnd.get("events") or []):
-        # hits on this receiver only
-        if not isinstance(e, dict) or str(e.get("receiver")) != rid:
-            continue
-        # throws only
-        if (e.get("weapon") or "").lower() != "throw":
-            continue
-        d = e.get("dmg")
-        if d is None:
-            continue
-        try:
-            dv = float(d)
-        except (TypeError, ValueError):
-            continue
-        # frostbyte damage values only
-        if _js_round(dv) in FROSTBYTE_THROW_DMG:
-            total += dv
-    return total
-
-# compact weapon record for one spectated match or none
-def _extract_match_fact(m):
-    players = m.get("players", [])
-    if len(players) != 2:
-        return None
-    p0, p1 = players[0], players[1]
-    l0, l1 = _ws_loadout(p0), _ws_loadout(p1)
-    # no weapon data on this row
-    if not l0 and not l1:
-        return None
-
-    fb0, fb1 = _loadout_frostbyte_name(l0), _loadout_frostbyte_name(l1)
-    # dmg0 is damage dealt by side 0 so side 1 received bucket
-    dmg0, dmg1 = {}, {}
-    rounds_counted = 0
-    nid0, nid1 = p0.get("networkId"), p1.get("networkId")
-    if nid0 is not None and nid1 is not None:
-        s0, s1 = str(nid0), str(nid1)
-        for r in (m.get("rounds") or []):
-            stats = r.get("stats") or {}
-            recv0 = stats.get(s0) or {}
-            recv1 = stats.get(s1) or {}
-            # round is from before damage tracking
-            if not recv0 and not recv1:
-                continue
-            rounds_counted += 1
-            # damage side 0 dealt
-            for wpn, amt in (recv1.get("Damage") or {}).items():
-                if amt and _is_weapon_source(wpn):
-                    k = _canon_weapon(wpn)
-                    dmg0[k] = dmg0.get(k, 0) + amt
-            # damage side 1 dealt
-            for wpn, amt in (recv0.get("Damage") or {}).items():
-                if amt and _is_weapon_source(wpn):
-                    k = _canon_weapon(wpn)
-                    dmg1[k] = dmg1.get(k, 0) + amt
-            # side 1 frostbyte throws into side 0
-            if fb1:
-                f = _frostbyte_throw_dmg(r, nid0)
-                if f:
-                    dmg1[fb1] = dmg1.get(fb1, 0) + f
-            # side 0 frostbyte throws into side 1
-            if fb0:
-                f = _frostbyte_throw_dmg(r, nid1)
-                if f:
-                    dmg0[fb0] = dmg0.get(fb0, 0) + f
-
-    d0 = p0.get("displayName") or ""
-    d1 = p1.get("displayName") or ""
-    # winner as side 0 or 1 or none
-    wl = (m.get("winner") or "").lower()
-    winner = 0 if (wl and wl == d0.lower()) else (1 if (wl and wl == d1.lower()) else None)
-
-    return {
-        "elo": [_ws_elo(p0), _ws_elo(p1)],
-        "name": [d0, d1],
-        "winner": winner,
-        "rounds": rounds_counted,
-        "sides": [
-            {"loadout": l0, "attach": _ws_attachments(p0), "dmg": dmg0},
-            {"loadout": l1, "attach": _ws_attachments(p1), "dmg": dmg1},
-        ],
-    }
-
-# weapon facts in memory and the mtimes they came from
+# weapon facts in memory plus the spectated matches and database generation they came from
 _wfacts_cache = None
 _wfacts_cache_key = None
+_wfacts_generation = None
 # results per elo filter and exclude list
 _weapon_agg_cache = {}
 
-# bump when the fact format changes so old disk caches are dropped
-# v5 matches frostbyte in any casing
-WEAPON_FACTS_VERSION = 5
-
-# weapon facts for the current match files
+# weapon facts for the current database
+# only rebuilt when spectated matches change
+# not on every leaderboard or stats poll
 def weapon_facts():
-    return _build_weapon_facts(_match_files_key())
-
-# facts for every usable spectated match
-# cached in memory and on disk like the merge
-def _build_weapon_facts(base_key):
-    global _wfacts_cache, _wfacts_cache_key
-    # match files unchanged so reuse the memory copy
-    if _wfacts_cache is not None and _wfacts_cache_key == base_key:
+    global _wfacts_cache, _wfacts_cache_key, _wfacts_generation
+    generation = data_generation()
+    if _wfacts_cache is not None and _wfacts_generation == generation:
         return _wfacts_cache
+    with open_db() as conn:
+        # spectated matches are never edited so their count and newest id say if anything changed
+        key = tuple(conn.execute("SELECT COUNT(*), MAX(id) FROM matches WHERE spectated = 1").fetchone())
+        if _wfacts_cache is None or _wfacts_cache_key != key:
+            _wfacts_cache = _build_weapon_facts(conn)
+            _wfacts_cache_key = key
+    _wfacts_generation = generation
+    return _wfacts_cache
 
-    # disk copy is newer and the same version so reuse it
-    source_key = max(base_key)
-    cache_mtime = os.path.getmtime(WEAPON_FACTS_FILE) if os.path.exists(WEAPON_FACTS_FILE) else 0
-    if cache_mtime > source_key:
-        cached = load_json(WEAPON_FACTS_FILE, None)
-        if isinstance(cached, dict) and cached.get("version") == WEAPON_FACTS_VERSION:
-            _wfacts_cache = cached.get("facts", [])
-            _wfacts_cache_key = base_key
-            return _wfacts_cache
+# compact weapon record for every spectated match with a loadout newest first
+# a few grouped queries instead of walking every match
+def _build_weapon_facts(conn):
+    facts = {}
+    for m in conn.execute("SELECT id, winner_slot FROM matches WHERE spectated = 1 ORDER BY started_at DESC, id DESC"):
+        facts[m["id"]] = {"elo": [None, None], "name": ["", ""], "winner": m["winner_slot"], "rounds": 0,
+                          "sides": [{"loadout": [], "attach": [], "dmg": {}}, {"loadout": [], "attach": [], "dmg": {}}]}
 
-    # merged list has elo attached and no corrections
-    base = _build_base_merged(base_key)
-    facts = []
-    for m in base:
-        # spectated matches only
-        if not m.get("spectated"):
+    for p in conn.execute("SELECT mp.match_id, mp.slot, mp.display_name, mp.elo FROM match_players mp "
+                          "JOIN matches m ON m.id = mp.match_id WHERE m.spectated = 1"):
+        f = facts[p["match_id"]]
+        f["name"][p["slot"]] = p["display_name"]
+        f["elo"][p["slot"]] = float(p["elo"]) if p["elo"] is not None else None
+
+    # unique weapons in loadout order plus every attachment
+    for w in conn.execute("SELECT match_id, slot, weapon, attachment FROM match_loadouts ORDER BY match_id, slot, position"):
+        if w["match_id"] not in facts:
             continue
-        f = _extract_match_fact(m)
-        if f is not None:
-            facts.append(f)
+        side = facts[w["match_id"]]["sides"][w["slot"]]
+        if w["weapon"] not in side["loadout"]:
+            side["loadout"].append(w["weapon"])
+        if w["attachment"]:
+            side["attach"].append(w["attachment"])
 
-    # save to memory and disk
-    _wfacts_cache = facts
-    _wfacts_cache_key = base_key
-    try:
-        save_json(WEAPON_FACTS_FILE, {"version": WEAPON_FACTS_VERSION, "facts": facts})
-    except OSError as e:
-        print(f"weapon facts cache write failed: {e}")
-    return facts
+    # rounds from before damage tracking have no stats so dont count
+    for r in conn.execute("SELECT match_id, COUNT(DISTINCT round_number) FROM round_stats GROUP BY match_id"):
+        if r[0] in facts:
+            facts[r[0]]["rounds"] = r[1]
+
+    # damage is stored by receiver so dealt damage goes to the other side
+    for s in conn.execute("SELECT match_id, receiver_slot, source, SUM(value) FROM round_stats "
+                          "WHERE stat_type = 'Damage' GROUP BY match_id, receiver_slot, source"):
+        match_id, receiver, source, total = s
+        if match_id not in facts or not total or not _is_weapon_source(source):
+            continue
+        dmg = facts[match_id]["sides"][1 - receiver]["dmg"]
+        k = _canon_weapon(source)
+        dmg[k] = dmg.get(k, 0) + total
+
+    # frostbyte throws are logged as plain throws so they are picked out by damage value
+    # only rounds with stats count like the damage above
+    marks = ",".join("?" * len(FROSTBYTE_THROW_DMG))
+    for e in conn.execute(f"""
+            SELECT e.match_id, e.receiver_slot, SUM(e.dmg) FROM round_events e
+            WHERE lower(e.weapon) = 'throw' AND CAST(e.dmg + 0.5 AS INTEGER) IN ({marks})
+            AND EXISTS (SELECT 1 FROM round_stats s WHERE s.match_id = e.match_id AND s.round_number = e.round_number)
+            GROUP BY e.match_id, e.receiver_slot""", FROSTBYTE_THROW_DMG):
+        match_id, receiver, total = e
+        if match_id not in facts or not total:
+            continue
+        dealer = facts[match_id]["sides"][1 - receiver]
+        frostbyte = next((w for w in dealer["loadout"] if w.lower() == "frostbyte"), None)
+        if frostbyte:
+            dealer["dmg"][frostbyte] = dealer["dmg"].get(frostbyte, 0) + total
+
+    # no weapon data on either side
+    return [f for f in facts.values() if f["sides"][0]["loadout"] or f["sides"][1]["loadout"]]
 
 # lowest and highest elo seen
 # bounds the frontend slider
@@ -756,53 +597,69 @@ def matchup_weapon_stats(name, opponent, facts):
 # api health and counts
 @app.get("/status")
 def get_status():
-    leaderboard = load_json_cached(LEADERBOARD_FILE, {})
-    players = load_json_cached(PLAYERS_FILE, {})
-    matches = merge_matches()
+    with open_db() as conn:
+        matches = conn.execute("SELECT COUNT(*) FROM v_matches").fetchone()[0]
+        players = conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
+        updated = conn.execute("SELECT MAX(updated_at) FROM seasons").fetchone()[0]
     return {
         "status": "running",
-        "matchesTracked": len(matches),
-        "playersTracked": len(players),
-        "leaderboardLastUpdated": leaderboard.get("lastUpdated"),
+        "matchesTracked": matches,
+        "playersTracked": players,
+        "leaderboardLastUpdated": updated,
     }
 
 # current or previous season ladder
 @app.get("/leaderboard")
 def get_leaderboard(season: Literal["current", "previous"] = "current"):
-    leaderboard = load_json_cached(LEADERBOARD_FILE, {})
-    # poller hasnt written it yet
-    if not leaderboard:
-        raise HTTPException(status_code=503, detail="Leaderboard data not yet available")
-    # plain str hint stops a false LiteralString warning in pycharm
-    key: str = "currentSeason" if season == "current" else "previousSeason"
-    data = leaderboard.get(key, {})
+    with open_db() as conn:
+        updated = conn.execute("SELECT MAX(updated_at) FROM seasons").fetchone()[0]
+        # poller hasnt written it yet
+        if updated is None:
+            raise HTTPException(status_code=503, detail="Leaderboard data not yet available")
+        row = conn.execute("SELECT version FROM seasons WHERE status = ?", (season,)).fetchone()
+        version = row["version"] if row else None
+        entries = conn.execute("SELECT * FROM leaderboard_entries WHERE season_version = ? ORDER BY position",
+                               (version,)).fetchall()
+    leaderboard = []
+    for e in entries:
+        # positions are stored from 1 but the server sends them from 0
+        entry = {"displayName": e["display_name"], "playFabMasterPlayerId": e["player_id"],
+                 "position": e["position"] - 1, "value": e["value"]}
+        if e["secondary_value"] is not None:
+            entry["secondaryValue"] = e["secondary_value"]
+        if e["formatted_value"] is not None:
+            entry["formattedValue"] = e["formatted_value"]
+        leaderboard.append(entry)
     return {
         "season": season,
-        "version": data.get("version"),
-        "lastUpdated": leaderboard.get("lastUpdated"),
-        "leaderboard": data.get("leaderboard", [])
+        "version": version,
+        "lastUpdated": updated,
+        "leaderboard": leaderboard
     }
 
 # player list sorted by lp or first seen
 @app.get("/players")
 def get_players(sort: str = "lp", limit: int = 500, streaks: bool = False):
-    players = load_json_cached(PLAYERS_FILE, {})
-    if not players:
-        raise HTTPException(status_code=503, detail="Player data not yet available")
-    player_list = list(players.values())
-    if sort == "lp":
-        player_list.sort(key=lambda p: p.get("currentSeasonLP") or 0, reverse=True)
-    elif sort == "first_seen":
-        player_list.sort(key=lambda p: p.get("firstSeen") or "", reverse=True)
-
+    # rowid keeps ties in the order players were added like before
+    # only these fixed strings ever go into the query
+    order = {"lp": "COALESCE(s.current_season_lp, 0) DESC, p.rowid",
+             "first_seen": "p.first_seen DESC, p.rowid"}.get(sort, "p.rowid")
     # cap the page size
     limit = max(1, min(limit, 1000))
-    sliced = player_list[:limit]
+    with open_db() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
+        if not total:
+            raise HTTPException(status_code=503, detail="Player data not yet available")
+        rows = conn.execute(PLAYERS_SQL + f"ORDER BY {order} LIMIT ?", (limit,)).fetchall()
+        stats = defaultdict(dict)
+        for s in conn.execute("SELECT * FROM player_stats"):
+            stats[s["player_id"]][s["stat_name"]] = s["value"]
+    sliced = [player_dict(r, stats[r["player_id"]]) for r in rows]
 
     # streaks only when asked for
     # other leaderboards skip the match scan
     if streaks:
-        streak_map = compute_all_streaks(merge_matches())
+        streak_map = all_streaks()
         enriched = []
         for pl in sliced:
             st = streak_map.get((pl.get("displayName") or "").lower())
@@ -815,27 +672,26 @@ def get_players(sort: str = "lp", limit: int = 500, streaks: bool = False):
             })
         sliced = enriched
 
-    return {"total": len(player_list), "players": sliced}
+    return {"total": total, "players": sliced}
 
 # full lp and elo timeline for a player
 @app.get("/players/{name}/lp-history")
 def get_lp_history(name: str):
-    players = load_json_cached(PLAYERS_FILE, {})
-    player = find_player(players, name)
-    if not player:
-        raise HTTPException(status_code=404, detail=f"Player '{name}' not found")
+    with open_db() as conn:
+        player = find_player(conn, name)
+        if not player:
+            raise HTTPException(status_code=404, detail=f"Player '{name}' not found")
+        rows = conn.execute(PLAYER_MATCHES_SQL, (name, name)).fetchall()
 
     # built from the match log so it isnt capped
-    # unlike the trimmed history snapshots
-    player_matches = build_player_matches(name, merge_matches())
     history = []
     # oldest first
-    for m in reversed(player_matches):
-        entry = {"timestamp": m.get("timestamp")}
-        if m.get("playerLP") is not None:
-            entry["lp"] = m["playerLP"]
-        if m.get("playerELO") is not None:
-            entry["elo"] = m["playerELO"]
+    for r in reversed(rows):
+        entry = {"timestamp": r["started_at"]}
+        if r["league_points"] is not None:
+            entry["lp"] = r["league_points"]
+        if r["elo"] is not None:
+            entry["elo"] = r["elo"]
         # skip matches with neither value
         if "lp" in entry or "elo" in entry:
             history.append(entry)
@@ -892,20 +748,19 @@ def _h2h_summary(name_l, h2h_matches):
 # head to head record between two players
 @app.get("/players/{name}/vs/{opponent}")
 def get_head_to_head(name: str, opponent: str):
-    matches = merge_matches()
-    h2h, name_wins, opponent_wins = [], 0, 0
-    for match in matches:
-        names = [(p.get("displayName") or "").lower() for p in match.get("players", [])]
+    with open_db() as conn:
         # both players in the match only
-        if name.lower() not in names or opponent.lower() not in names:
-            continue
+        ids = [r[0] for r in conn.execute(
+            "SELECT match_id FROM v_player_matches WHERE display_name = ? COLLATE NOCASE "
+            "AND opponent_name = ? COLLATE NOCASE GROUP BY match_id ORDER BY MAX(started_at) DESC, match_id DESC",
+            (name, opponent))]
+        # full matches so the frontend can show detail
+        h2h = build_matches(conn, ids)
+    name_wins, opponent_wins = 0, 0
+    for match in h2h:
         winner = (match.get("winner") or "").lower()
         if winner == name.lower(): name_wins += 1
         elif winner == opponent.lower(): opponent_wins += 1
-        # full match so the frontend can show detail
-        h2h.append(match)
-    # newest first
-    h2h.sort(key=lambda m: m.get("timestamp") or "", reverse=True)
     total = name_wins + opponent_wins
     return {"playerOne": name, "playerTwo": opponent, "playerOneWins": name_wins,
             "playerTwoWins": opponent_wins, "totalMatches": total,
@@ -917,17 +772,12 @@ def get_head_to_head(name: str, opponent: str):
 # tournament placements and prize money for a player
 @app.get("/players/{name}/tournaments")
 def get_player_tournaments(name: str):
-    tournaments = load_json_cached(TOURNAMENTS_FILE, [])
-    results = []
-    for t in tournaments:
-        for p in t.get("placement", []):
-            if (p.get("displayName") or "").lower() == name.lower():
-                # get so one incomplete entry cant crash the route
-                results.append({
-                    "name": t.get("name"),
-                    "place": p.get("place"),
-                    "prizeMoney": p.get("prizeMoney") or 0
-                })
+    with open_db() as conn:
+        rows = conn.execute(
+            "SELECT t.name, p.place, p.prize_money FROM tournament_placements p "
+            "JOIN tournaments t ON t.id = p.tournament_id WHERE p.display_name = ? COLLATE NOCASE ORDER BY t.id",
+            (name,)).fetchall()
+    results = [{"name": r["name"], "place": r["place"], "prizeMoney": r["prize_money"]} for r in rows]
     total = sum(r["prizeMoney"] for r in results)
     return {"results": results, "totalPrizeMoney": total}
 
@@ -960,17 +810,29 @@ def _streaks(seq):
             "bestWin": best_win, "bestLoss": best_loss}
 
 # streaks for every player in one pass
-# matches are newest first
-def compute_all_streaks(matches):
+# rows are lowercase name and won newest first
+def compute_all_streaks(rows):
     # lowercase name to results newest first
     seqs = defaultdict(list)
-    for match in matches:
-        winner = (match.get("winner") or "").lower()
-        for pl in match.get("players", []):
-            nm = (pl.get("displayName") or "").lower()
-            if nm:
-                seqs[nm].append("win" if nm == winner else "loss")
+    for nm, won in rows:
+        if nm:
+            seqs[nm].append("win" if won else "loss")
     return {nm: _streaks(seq) for nm, seq in seqs.items()}
+
+# streak map in memory and the database generation it came from
+_streak_cache = None
+_streak_cache_key = None
+
+# streaks for every player rebuilt only when the database changes
+def all_streaks():
+    global _streak_cache, _streak_cache_key
+    key = data_generation()
+    if _streak_cache is None or _streak_cache_key != key:
+        with open_db() as conn:
+            _streak_cache = compute_all_streaks(conn.execute(
+                "SELECT lower(display_name), won FROM v_player_matches ORDER BY started_at DESC, match_id DESC, slot"))
+        _streak_cache_key = key
+    return _streak_cache
 
 # every match for a player newest first from their side
 def build_player_matches(name, matches):
@@ -1013,69 +875,67 @@ def build_player_matches(name, matches):
 # full player profile
 @app.get("/players/{name}")
 def get_player(name: str):
-    players = load_json_cached(PLAYERS_FILE, {})
-    matches = merge_matches()
-    player = find_player(players, name)
-    if not player:
-        raise HTTPException(status_code=404, detail=f"Player '{name}' not found")
+    with open_db() as conn:
+        player = find_player(conn, name)
+        if not player:
+            raise HTTPException(status_code=404, detail=f"Player '{name}' not found")
+        rows = conn.execute(PLAYER_MATCHES_SQL, (name, name)).fetchall()
 
-    name_l = name.lower()
-    player_matches = build_player_matches(name, matches)
-    # match and round totals
-    wins = sum(1 for m in player_matches if m["result"] == "win")
-    losses = len(player_matches) - wins
-    rounds_won = sum(
-        sum(1 for r in m["roundWinners"] if (r or "").lower() == name_l)
-        for m in player_matches
-    )
-    rounds_lost = sum(len(m["roundWinners"]) for m in player_matches) - rounds_won
-    total = len(player_matches)
+        # round totals from the player side of every match
+        rounds_won, rounds_total = conn.execute(
+            f"SELECT COALESCE(SUM(r.winner_slot = pm.slot), 0), COUNT(*) FROM ({PLAYER_MATCHES_SQL}) pm "
+            "JOIN v_rounds r ON r.match_id = pm.match_id", (name, name)).fetchone()
+
+        # latest avatar from the newest spectated match
+        avatar = conn.execute(
+            "SELECT mp.character FROM match_players mp JOIN v_matches m ON m.id = mp.match_id "
+            "WHERE mp.display_name = ? COLLATE NOCASE AND mp.character IS NOT NULL "
+            "ORDER BY m.started_at DESC, m.id DESC LIMIT 1", (name,)).fetchone()
+
+        recent = build_player_matches(name, build_matches(conn, [r["match_id"] for r in rows[:20]]))
+
+    # match totals
+    wins = sum(1 for r in rows if r["won"])
+    total = len(rows)
 
     # current and best streaks
-    streaks = _streaks([m["result"] for m in player_matches])
+    streaks = _streaks(["win" if r["won"] else "loss" for r in rows])
 
     # most played opponent
+    # ties go to whoever was played most recently
     opponent_counts = {}
-    for m in player_matches:
-        opp = m.get("opponent")
-        if opp and opp != "Unknown":
+    for r in rows:
+        opp = r["opponent_name"]
+        if opp and opp.lower() != name.lower():
             opponent_counts[opp] = opponent_counts.get(opp, 0) + 1
     most_played = max(opponent_counts, key=opponent_counts.get) if opponent_counts else None
 
-    # latest avatar from the newest spectated match
-    last_avatar = None
-    for m in player_matches:
-        for pl in m.get("players", []):
-            if (pl.get("displayName") or "").lower() == name_l and pl.get("character"):
-                last_avatar = pl["character"]
-                break
-        if last_avatar:
-            break
-
     return {
         **player,
-        "wins": wins, "losses": losses,
+        "wins": wins, "losses": total - wins,
         "winRate": round(wins / total * 100, 1) if total > 0 else 0,
-        "roundsWon": rounds_won, "roundsLost": rounds_lost,
+        "roundsWon": rounds_won, "roundsLost": rounds_total - rounds_won,
         "matchesTracked": total,
         "mostPlayedOpponent": most_played,
         "currentStreak": streaks["current"],
         "streakType": streaks["type"],
         "bestWinStreak": streaks["bestWin"],
         "bestLossStreak": streaks["bestLoss"],
-        "lastAvatar": last_avatar,
-        "recentMatches": player_matches[:20],
+        "lastAvatar": avatar[0] if avatar else None,
+        "recentMatches": recent,
         "weaponStats": player_weapon_stats(name, weapon_facts()),
     }
 
 # one page of a player match history
 @app.get("/players/{name}/matches")
 def get_player_matches(name: str, page: int = 1, per_page: int = 20):
-    players = load_json_cached(PLAYERS_FILE, {})
-    if not find_player(players, name):
-        raise HTTPException(status_code=404, detail=f"Player '{name}' not found")
-
-    return _paginate(build_player_matches(name, merge_matches()), page, per_page)
+    with open_db() as conn:
+        if not find_player(conn, name):
+            raise HTTPException(status_code=404, detail=f"Player '{name}' not found")
+        ids, info = _paged_ids(conn, PLAYER_MATCH_IDS_SQL,
+                               (name, name), page, per_page)
+        matches = build_matches(conn, ids)
+    return {"matches": build_player_matches(name, matches), **info}
 
 # global match log with optional player filter
 @app.get("/matches")
@@ -1083,20 +943,22 @@ def get_matches(limit: int = 100, player: str | None = None, page: int | None = 
                 per_page: int = 20):
     # cap the old mode size like the other routes
     limit = max(1, min(limit, 1000))
-    matches = merge_matches()
     if player:
-        matches = [m for m in matches if any(
-            (p.get("displayName") or "").lower() == player.lower()
-            for p in m.get("players", []))]
-    total = len(matches)
+        sql, params = PLAYER_MATCH_IDS_SQL, (player, player)
+    else:
+        sql, params = "SELECT id FROM v_matches ORDER BY started_at DESC, id DESC", ()
 
-    # paged mode when page is given
-    # same shape as the player matches route
-    if page is not None:
-        return _paginate(matches, page, per_page)
+    with open_db() as conn:
+        # paged mode when page is given
+        # same shape as the player matches route
+        if page is not None:
+            ids, info = _paged_ids(conn, sql, params, page, per_page)
+            return {"matches": build_matches(conn, ids), **info}
 
-    # old mode for callers using only limit
-    return {"total": total, "matches": matches[:limit]}
+        # old mode for callers using only limit
+        total = conn.execute(f"SELECT COUNT(*) FROM ({sql})", params).fetchone()[0]
+        ids = [r[0] for r in conn.execute(f"{sql} LIMIT ?", (*params, limit))]
+        return {"total": total, "matches": build_matches(conn, ids)}
 
 
 # stream info as stored
@@ -1104,28 +966,24 @@ def get_matches(limit: int = 100, player: str | None = None, page: int | None = 
 def get_stream():
     return load_json_cached(STREAM_FILE, {})
 
-# tournaments as stored
+# tournaments in the same shape as the old json file
 @app.get("/tournaments")
 def get_tournaments():
-    return load_json_cached(TOURNAMENTS_FILE, [])
+    with open_db() as conn:
+        tournaments = {t["id"]: {"id": t["id"], "name": t["name"], "placement": []}
+                       for t in conn.execute("SELECT * FROM tournaments ORDER BY id")}
+        for p in conn.execute("SELECT * FROM tournament_placements ORDER BY tournament_id, place"):
+            tournaments[p["tournament_id"]]["placement"].append(
+                {"displayName": p["display_name"], "place": p["place"], "prizeMoney": p["prize_money"]})
+    return list(tournaments.values())
 
 # total prize money per player highest first
 @app.get("/leaderboard/earnings")
 def get_earnings_leaderboard():
-    tournaments = load_json_cached(TOURNAMENTS_FILE, [])
-    earnings = {}
-    for t in tournaments:
-        for p in t.get("placement", []):
-            name = p.get("displayName")
-            prize = p.get("prizeMoney", 0)
-            if name and prize:
-                earnings[name] = earnings.get(name, 0) + prize
-    ranked = sorted(
-        [{"displayName": name, "totalEarnings": total} for name, total in earnings.items()],
-        key=lambda x: x["totalEarnings"],
-        reverse=True
-    )
-    return {"leaderboard": ranked}
+    with open_db() as conn:
+        rows = conn.execute("SELECT display_name, total_earnings FROM v_earnings "
+                            "ORDER BY total_earnings DESC, display_name").fetchall()
+    return {"leaderboard": [{"displayName": r[0], "totalEarnings": r[1]} for r in rows]}
 
 # global weapon stats for an elo range
 # both mode is the bracket meta
@@ -1135,8 +993,8 @@ def get_earnings_leaderboard():
 @app.get("/weapons")
 def get_weapons(min_elo: float | None = None, max_elo: float | None = None,
                 mode: Literal["both", "opponent"] = "both", exclude: str | None = None):
-    base_key = _match_files_key()
-    facts = _build_weapon_facts(base_key)
+    facts = weapon_facts()
+    base_key = _wfacts_cache_key
 
     # default to the full observed range
     erange = _ws_observed_elo_range(facts)
@@ -1167,32 +1025,20 @@ def get_weapons(min_elo: float | None = None, max_elo: float | None = None,
 # match timestamps for the activity graph
 @app.get("/activity")
 def get_activity(window: str = "all", min_lp: int = 0):
+    sql, params = "SELECT started_at FROM v_matches m WHERE 1 = 1", []
     # week window cutoff
-    cutoff = None
+    # timestamps are stored in one format so they compare as text
     if window == "week":
-        cutoff = datetime.now(timezone.utc).timestamp() - (7 * 24 * 3600)
+        sql += " AND m.started_at >= ?"
+        params.append((datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S"))
+    # needs a player at or above min lp
+    if min_lp > 0:
+        sql += " AND EXISTS (SELECT 1 FROM match_players p WHERE p.match_id = m.id AND COALESCE(p.league_points, 0) >= ?)"
+        params.append(min_lp)
 
-    timestamps = []
-    # merged list so each game counts once
-    # and invalid or excluded matches are left out
-    for m in merge_matches():
-        ts = m.get("timestamp")
-        if not ts:
-            continue
-        # skip matches older than the cutoff
-        if cutoff is not None:
-            try:
-                t = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-                if t < cutoff:
-                    continue
-            except ValueError:
-                continue
-        # needs a player at or above min lp
-        if min_lp > 0:
-            players = m.get("players", [])
-            if not any((p.get("leaguePoints") or 0) >= min_lp for p in players):
-                continue
-        timestamps.append(ts)
+    # excluded matches are already left out by the view
+    with open_db() as conn:
+        timestamps = [r[0] for r in conn.execute(sql + " ORDER BY m.started_at DESC, m.id DESC", params)]
     return {"timestamps": timestamps, "total": len(timestamps), "window": window}
 
 # error handlers
