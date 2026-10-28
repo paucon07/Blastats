@@ -1060,3 +1060,4 @@ app.mount("/avatars", StaticFiles(directory=AVATARS_DIR), name="avatars")
 app.mount("/icons", StaticFiles(directory=ICONS_DIR), name="icons")
 # frontend from the static folder only
 # must be last since it catches every path
+app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
