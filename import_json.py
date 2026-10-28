@@ -1,12 +1,12 @@
 import argparse
 import json
 import os
-import re
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
 
 import db
+import store
 from api import WEAPON_NAMES
+from store import PAIR_WINDOW, Skip, is_valid_match, low, pair_key, to_float, to_int
 
 # json files in the data folder
 MATCHES_FILE = "matches.json"
@@ -15,9 +15,6 @@ PLAYERS_FILE = "players.json"
 LEADERBOARD_FILE = "leaderboard.json"
 CORRECTIONS_FILE = "corrections.json"
 TOURNAMENTS_FILE = "tournaments.json"
-
-# a spectated match and an announcement this many seconds apart are the same game
-PAIR_WINDOW = 180
 
 # reasons rows were left out
 # printed at the end so nothing goes missing silently
@@ -32,55 +29,9 @@ def load_json(path, default):
             except json.JSONDecodeError: return default
     return default
 
-# iso timestamp to utc datetime or none
-def parse_ts(s):
-    if not isinstance(s, str) or not s.strip():
-        return None
-    s = s.strip()
-    if s[-1] in "Zz":
-        s = s[:-1] + "+00:00"
-    # the mod writes 7 digit fractions and older pythons only read 3 or 6
-    s = re.sub(r"\.(\d{6})\d+", r".\1", s)
-    s = re.sub(r"\.(\d{1,5})(?=[+-]|$)", lambda m: "." + m.group(1).ljust(6, "0"), s)
-    try:
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        return None
-    # no timezone so assume utc like rectify
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-# utc datetime to the one text format used in the database
-# same length every time so timestamps sort correctly as text
-def iso(dt):
-    dt = dt.astimezone(timezone.utc)
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
-
-# timestamp text to database format or none
-def norm_ts(s):
-    dt = parse_ts(s)
-    return iso(dt) if dt else None
-
-# value as an int or none
-def to_int(v):
-    try:
-        return int(v) if v is not None and v != "" else None
-    except (TypeError, ValueError):
-        return None
-
-# value as a float or none
-def to_float(v):
-    try:
-        return float(v) if v is not None and v != "" else None
-    except (TypeError, ValueError):
-        return None
-
-# lowercase name used for every name comparison like the api
-def low(name):
-    return (name or "").lower()
-
 # players
 # load players and their stats
-# returns every player id plus lowercase name to player id for linking matches
+# returns every player id for linking ladder entries
 def import_players(conn, players, now):
     rows, stats = [], []
     for key, p in players.items():
@@ -88,11 +39,11 @@ def import_players(conn, players, now):
         if not name:
             skipped["player with no name"] += 1
             continue
-        first = norm_ts(p.get("firstSeen")) or norm_ts(p.get("lastSeen")) or now
-        last = norm_ts(p.get("lastSeen")) or first
+        first = db.norm_ts(p.get("firstSeen")) or db.norm_ts(p.get("lastSeen")) or now
+        last = db.norm_ts(p.get("lastSeen")) or first
         rows.append((key, name, p.get("source") or "unknown", first, last,
-                     norm_ts(p.get("accountCreated")), norm_ts(p.get("accountCheckedAt")),
-                     norm_ts(p.get("statsLastUpdated")), norm_ts(p.get("statsBackfilledAt"))))
+                     db.norm_ts(p.get("accountCreated")), db.norm_ts(p.get("accountCheckedAt")),
+                     db.norm_ts(p.get("statsLastUpdated")), db.norm_ts(p.get("statsBackfilledAt"))))
         for stat, value in (p.get("stats") or {}).items():
             value = to_int(value)
             if value is not None:
@@ -100,18 +51,12 @@ def import_players(conn, players, now):
 
     conn.executemany("INSERT INTO players VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
     conn.executemany("INSERT INTO player_stats VALUES (?, ?, ?)", stats)
-
-    # real ids win over legacy name ids then the most recently seen wins
-    # so a reused name links to the account using it now
-    by_name = {}
-    for key, name, _, _, last, *_ in sorted(rows, key=lambda r: (not r[0].startswith("name:"), r[4])):
-        by_name[low(name)] = key
-    return {r[0] for r in rows}, by_name
+    return {r[0] for r in rows}
 
 # seasons
 # current and previous season ladders
 def import_leaderboard(conn, lb, player_ids, now):
-    updated = norm_ts(lb.get("lastUpdated")) or now
+    updated = db.norm_ts(lb.get("lastUpdated")) or now
     seen_versions = set()
     for status, key in (("current", "currentSeason"), ("previous", "previousSeason")):
         season = lb.get(key) or {}
@@ -140,51 +85,20 @@ def import_leaderboard(conn, lb, player_ids, now):
                 to_int(e.get("secondaryValue")), e.get("formattedValue")))
 
 # weapons
-# any id or display name to display name ignoring case
-WEAPON_CANON = {}
-for _internal, _display in WEAPON_NAMES.items():
-    WEAPON_CANON[_internal.lower()] = _display
-    WEAPON_CANON[_display.lower()] = _display
-
+# every known weapon so loadouts can be stored under display names
 def import_weapons(conn):
     conn.executemany("INSERT INTO weapons VALUES (?, ?)",
                      [(display, internal) for internal, display in WEAPON_NAMES.items()])
-
-# display name for a weapon adding any unknown ones to the weapons table
-def weapon_name(conn, name):
-    canon = WEAPON_CANON.get(name.lower())
-    if canon:
-        return canon
-    conn.execute("INSERT OR IGNORE INTO weapons (name) VALUES (?)", (name,))
-    WEAPON_CANON[name.lower()] = name
-    return name
 
 # match pairing
 # same rules as _build_base_merged in the api
 # returns spectated and announcement pairs where either side can be none
 
-# lowercase names of both players as a set
-def pair_key(m):
-    return frozenset(low(p.get("displayName")) for p in m.get("players", []))
-
-# check a match is a real best of 3 result like is_valid_match
-def is_valid_match(m):
-    players = m.get("players", [])
-    winner = m.get("winner", "")
-    round_winners = m.get("roundWinners", [])
-    if len(players) != 2 or not winner:
-        return False
-    n = len(round_winners)
-    if n < 2 or n > 3:
-        return False
-    winner_rounds = sum(1 for r in round_winners if low(r) == low(winner))
-    return winner_rounds == 2 and (n - winner_rounds) <= 1
-
 def pair_matches(mod_matches, announcements):
     # group announcements by player pair
     ann_by_pair = defaultdict(list)
     for ann in announcements:
-        t = parse_ts(ann.get("timestamp"))
+        t = db.parse_ts(ann.get("timestamp"))
         if t is None:
             skipped["announcement with a bad timestamp"] += 1
             continue
@@ -202,7 +116,7 @@ def pair_matches(mod_matches, announcements):
     pairs = []
     times_by_pair = defaultdict(list)
     for m in mods:
-        t = parse_ts(m.get("timestamp"))
+        t = db.parse_ts(m.get("timestamp"))
         if t is None:
             skipped["spectated match with a bad timestamp"] += 1
             continue
@@ -230,134 +144,6 @@ def pair_matches(mod_matches, announcements):
             pairs.append((None, ann))
     return pairs
 
-# matches
-# slot of a player name or actor id or none
-def find_slot(name, names, network_ids):
-    name = low(name)
-    if name in names:
-        return names.index(name)
-    # the mod writes actor and the network id when it couldnt resolve a name
-    m = re.fullmatch(r"actor_(\d+)", name)
-    if m and int(m.group(1)) in network_ids:
-        return network_ids.index(int(m.group(1)))
-    return None
-
-# insert one match and everything under it
-# returns the new match id or none if it was left out
-def import_match(conn, mod, ann, player_ids, seen_ids):
-    base = mod or ann
-    players = base.get("players", [])
-    names = [low(p.get("displayName")) for p in players]
-    if len(players) != 2 or not all(names):
-        skipped["match without two players"] += 1
-        return None
-    network_ids = [to_int(p.get("networkId")) for p in players]
-
-    # winners by slot from the round winners list
-    round_slots = [find_slot(r, names, network_ids) for r in base.get("roundWinners") or []]
-    winner_slot = find_slot(base.get("winner"), names, network_ids)
-    if None in round_slots or winner_slot is None:
-        skipped["round winner not one of the players"] += 1
-        return None
-    # old poller rows picked up rounds from other games
-    if len(round_slots) not in (2, 3):
-        skipped["more than 3 rounds or fewer than 2"] += 1
-        return None
-    # two headsets on one account so names cant tell the sides apart
-    # slot 0 wins and the round order is guessed like the poller does
-    if names[0] == names[1]:
-        winner_slot = 0
-        round_slots = [0, 0] if len(round_slots) == 2 else [0, 1, 0]
-
-    ann_id = ann.get("match_id") if ann else None
-    spec_id = mod.get("match_id") if mod else None
-    # hand made rows sometimes reused an id so they get a numbered copy of it
-    if ann_id and ann_id in seen_ids["ann"]:
-        n = 2
-        while f"{ann_id}#{n}" in seen_ids["ann"]:
-            n += 1
-        ann_id = f"{ann_id}#{n}"
-        skipped["duplicate announcement id kept with a number added"] += 1
-    if spec_id and spec_id in seen_ids["spec"]:
-        skipped["duplicate spectated match id"] += 1
-        return None
-
-    # announcement time when there is one like the api
-    started = norm_ts((ann or mod).get("timestamp"))
-    if started is None:
-        skipped["match with a bad timestamp"] += 1
-        return None
-    if ann_id:
-        seen_ids["ann"].add(ann_id)
-    if spec_id:
-        seen_ids["spec"].add(spec_id)
-
-    cur = conn.execute(
-        "INSERT INTO matches (announcement_id, spectate_id, started_at, ended_at, spectated, "
-        "region, end_reason, winner_slot, round_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (ann_id, spec_id, started, norm_ts(mod.get("matchEndTime")) if mod else None,
-         1 if mod else 0, mod.get("region") if mod else None,
-         mod.get("endReason") if mod else None, winner_slot, len(round_slots)))
-    match_id = cur.lastrowid
-
-    # elo and rounds start only come from the announcement
-    ann_players = {low(p.get("displayName")): p for p in (ann.get("players", []) if ann else [])}
-    for slot, p in enumerate(players):
-        a = ann_players.get(names[slot]) or p
-        conn.execute(
-            "INSERT INTO match_players VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (match_id, slot, player_ids.get(names[slot]), p.get("displayName"),
-             to_int(p.get("leaguePoints")), to_int(a.get("elo")),
-             to_int(a.get("roundsStart")), network_ids[slot],
-             to_int(p.get("characterId")), p.get("character"), p.get("characterName"),
-             to_int(p.get("ping"))))
-        # scoreboard weapons in the order they were shown
-        for position, w in enumerate(p.get("weapons") or []):
-            if not w.get("name"):
-                continue
-            conn.execute("INSERT INTO match_loadouts VALUES (?, ?, ?, ?, ?)",
-                         (match_id, slot, position, weapon_name(conn, w["name"]), w.get("attachment") or None))
-
-    # round detail only lines up when the mod has one entry per round
-    details = (mod.get("rounds") or []) if mod else []
-    if details and len(details) != len(round_slots):
-        skipped["round detail that doesnt match the round count"] += 1
-        details = []
-
-    for i, winner in enumerate(round_slots):
-        number = i + 1
-        r = details[i] if details else {}
-        duration = to_float(r.get("durationSeconds"))
-        forfeit = find_slot(f"actor_{r.get('forfeitPlayerId')}", names, network_ids) if r.get("endedByForfeit") else None
-        conn.execute("INSERT INTO rounds VALUES (?, ?, ?, ?, ?, ?, ?)",
-                     (match_id, number, winner, duration if duration and duration > 0 else None,
-                      forfeit, to_int(r.get("p1Health")), to_int(r.get("p2Health"))))
-
-        # totals per player keyed by network id then type then source
-        for nid, by_type in (r.get("stats") or {}).items():
-            receiver = find_slot(f"actor_{nid}", names, network_ids)
-            if receiver is None or not isinstance(by_type, dict):
-                continue
-            for stat_type, sources in by_type.items():
-                for source, value in (sources or {}).items():
-                    value = to_float(value)
-                    if value is not None:
-                        conn.execute("INSERT INTO round_stats VALUES (?, ?, ?, ?, ?, ?)",
-                                     (match_id, number, receiver, stat_type, source, value))
-
-        # per hit timeline in the order logged
-        seq = 0
-        for e in r.get("events") or []:
-            receiver = find_slot(f"actor_{e.get('receiver')}", names, network_ids)
-            t, dmg = to_float(e.get("t")), to_float(e.get("dmg"))
-            if receiver is None or t is None or dmg is None:
-                skipped["damage event missing a field or receiver"] += 1
-                continue
-            conn.execute("INSERT INTO round_events VALUES (?, ?, ?, ?, ?, ?, ?)",
-                         (match_id, number, seq, t, e.get("weapon") or "", receiver, dmg))
-            seq += 1
-    return match_id
-
 # corrections
 # keyed by announcement id and only ever applied to unspectated matches
 def import_corrections(conn, corrections, now):
@@ -383,7 +169,7 @@ def import_corrections(conn, corrections, now):
             c.get("note"), now))
 
 # tournaments
-def import_tournaments(conn, tournaments, player_ids):
+def import_tournaments(conn, tournaments):
     for t in tournaments:
         name = t.get("name")
         if not name or conn.execute("SELECT 1 FROM tournaments WHERE name = ?", (name,)).fetchone():
@@ -403,31 +189,34 @@ def import_tournaments(conn, tournaments, player_ids):
                 continue
             names.add(low(display))
             conn.execute("INSERT INTO tournament_placements VALUES (?, ?, ?, ?, ?)",
-                         (tid, display, player_ids.get(low(display)), place, to_float(p.get("prizeMoney")) or 0))
+                         (tid, display, store.player_id(conn, display), place, to_float(p.get("prizeMoney")) or 0))
 
 # run everything inside one transaction
 def import_all(conn, data_dir):
     path = lambda f: os.path.join(data_dir, f)
-    now = iso(datetime.now(timezone.utc))
+    now = db.now_iso()
 
     import_weapons(conn)
-    all_ids, player_ids = import_players(conn, load_json(path(PLAYERS_FILE), {}), now)
-    import_leaderboard(conn, load_json(path(LEADERBOARD_FILE), {}), all_ids, now)
+    player_ids = import_players(conn, load_json(path(PLAYERS_FILE), {}), now)
+    import_leaderboard(conn, load_json(path(LEADERBOARD_FILE), {}), player_ids, now)
 
     # oldest first so match ids follow time
     pairs = pair_matches(load_json(path(MATCHES_FILE), []), load_json(path(ALL_MATCHES_FILE), []))
-    pairs.sort(key=lambda pair: parse_ts((pair[1] or pair[0]).get("timestamp")))
-    seen_ids = {"ann": set(), "spec": set()}
+    pairs.sort(key=lambda pair: db.parse_ts((pair[1] or pair[0]).get("timestamp")))
     for mod, ann in pairs:
-        import_match(conn, mod, ann, player_ids, seen_ids)
+        try:
+            store.insert_match(conn, mod, ann, renumber=True)
+        except Skip as e:
+            skipped[str(e)] += 1
 
     import_corrections(conn, load_json(path(CORRECTIONS_FILE), {}), now)
-    import_tournaments(conn, load_json(path(TOURNAMENTS_FILE), []), player_ids)
+    import_tournaments(conn, load_json(path(TOURNAMENTS_FILE), []))
 
 # build into a temp file and swap it in at the end
 # a failed import never leaves a half filled database behind
 def run(data_dir, out, replace):
     skipped.clear()
+    store.notes.clear()
     if os.path.exists(out) and not replace:
         raise SystemExit(f"{out} already exists, rerun with --replace to overwrite it")
     tmp = out + ".import"
@@ -468,6 +257,10 @@ def run(data_dir, out, replace):
     if skipped:
         print("left out")
         for reason, n in skipped.most_common():
+            print(f"  {reason:<50} {n}")
+    if store.notes:
+        print("kept with notes")
+        for reason, n in store.notes.most_common():
             print(f"  {reason:<50} {n}")
 
 # run by hand once to move the json data into the database

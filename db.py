@@ -1,5 +1,7 @@
 import os
+import re
 import sqlite3
+from datetime import datetime, timezone
 
 # file paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -40,6 +42,39 @@ def init_db(db):
     if version != SCHEMA_VERSION:
         db.close()
         raise RuntimeError(f"database is on schema version {version} but the code expects {SCHEMA_VERSION}")
+
+# timestamps
+# iso timestamp to utc datetime or none
+def parse_ts(s):
+    if not isinstance(s, str) or not s.strip():
+        return None
+    s = s.strip()
+    if s[-1] in "Zz":
+        s = s[:-1] + "+00:00"
+    # the mod writes 7 digit fractions and older pythons only read 3 or 6
+    s = re.sub(r"\.(\d{6})\d+", r".\1", s)
+    s = re.sub(r"\.(\d{1,5})(?=[+-]|$)", lambda m: "." + m.group(1).ljust(6, "0"), s)
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    # no timezone so assume utc like rectify
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+# utc datetime to the one text format used in the database
+# same length every time so timestamps sort correctly as text
+def iso(dt):
+    dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+# timestamp text to database format or none
+def norm_ts(s):
+    dt = parse_ts(s)
+    return iso(dt) if dt else None
+
+# current time in database format
+def now_iso():
+    return iso(datetime.now(timezone.utc))
 
 # run by hand to create the database
 if __name__ == "__main__":
