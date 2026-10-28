@@ -248,8 +248,8 @@ def import_match(conn, mod, ann, player_ids, seen_ids):
     base = mod or ann
     players = base.get("players", [])
     names = [low(p.get("displayName")) for p in players]
-    if len(players) != 2 or not all(names) or names[0] == names[1]:
-        skipped["match without two different players"] += 1
+    if len(players) != 2 or not all(names):
+        skipped["match without two players"] += 1
         return None
     network_ids = [to_int(p.get("networkId")) for p in players]
 
@@ -259,15 +259,25 @@ def import_match(conn, mod, ann, player_ids, seen_ids):
     if None in round_slots or winner_slot is None:
         skipped["round winner not one of the players"] += 1
         return None
-    if len(round_slots) not in (2, 3) or round_slots.count(winner_slot) != 2:
-        skipped["match not a valid best of 3"] += 1
+    # old poller rows picked up rounds from other games
+    if len(round_slots) not in (2, 3):
+        skipped["more than 3 rounds or fewer than 2"] += 1
         return None
+    # two headsets on one account so names cant tell the sides apart
+    # slot 0 wins and the round order is guessed like the poller does
+    if names[0] == names[1]:
+        winner_slot = 0
+        round_slots = [0, 0] if len(round_slots) == 2 else [0, 1, 0]
 
     ann_id = ann.get("match_id") if ann else None
     spec_id = mod.get("match_id") if mod else None
+    # hand made rows sometimes reused an id so they get a numbered copy of it
     if ann_id and ann_id in seen_ids["ann"]:
-        skipped["duplicate announcement id"] += 1
-        return None
+        n = 2
+        while f"{ann_id}#{n}" in seen_ids["ann"]:
+            n += 1
+        ann_id = f"{ann_id}#{n}"
+        skipped["duplicate announcement id kept with a number added"] += 1
     if spec_id and spec_id in seen_ids["spec"]:
         skipped["duplicate spectated match id"] += 1
         return None
