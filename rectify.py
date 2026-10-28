@@ -1,8 +1,7 @@
-import json
-import os
-import time
 from collections import defaultdict
 from datetime import datetime, timezone
+
+import db
 
 # elo moves this size or smaller are noise
 EPS = 2
@@ -15,28 +14,33 @@ DOWNTIME_HOURS = 18
 FAR = datetime.max.replace(tzinfo=timezone.utc)
 
 
-# read a json file or none if missing or broken
-def load_json(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
+# poller matches in the same shape the old all matches json had
+# winner is the recorded one before any corrections
+def load_matches(conn):
+    players = defaultdict(list)
+    for p in conn.execute("SELECT match_id, display_name, elo, rounds_start FROM match_players ORDER BY match_id, slot"):
+        players[p["match_id"]].append({"displayName": p["display_name"], "elo": p["elo"],
+                                       "roundsStart": p["rounds_start"]})
+    matches = []
+    # only matches the poller saw have elo and rounds start to judge with
+    for m in conn.execute("SELECT id, started_at, winner_slot, spectated FROM matches "
+                          "WHERE announcement_id IS NOT NULL ORDER BY started_at, id"):
+        ps = players[m["id"]]
+        if len(ps) != 2:
+            continue
+        matches.append({"match_id": m["id"], "timestamp": m["started_at"], "spectated": m["spectated"],
+                        "winner": ps[m["winner_slot"]]["displayName"], "players": ps})
+    return matches
 
-# write to a temp file then swap it in
-def save_json(path, data):
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    # windows blocks the swap while a reader has the file open so retry briefly
-    for attempt in range(5):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            if attempt == 4:
-                raise
-            time.sleep(0.1)
+# players with their stats in the same shape the old players json had
+def load_players(conn):
+    players = {}
+    for p in conn.execute("SELECT player_id, display_name, stats_updated_at FROM players"):
+        players[p["player_id"]] = {"displayName": p["display_name"], "stats": {},
+                                   "statsLastUpdated": p["stats_updated_at"]}
+    for s in conn.execute("SELECT * FROM player_stats"):
+        players[s["player_id"]]["stats"][s["stat_name"]] = s["value"]
+    return players
 
 # iso timestamp to utc datetime or none
 def parse_ts(s):
@@ -136,13 +140,21 @@ def judge(m, timelines, pos, current, gaps):
     return None
 
 
-# rebuild corrections json from scratch and return the number of flips
-def rectify(data_dir):
-    matches = load_json(os.path.join(data_dir, "all_matches.json"))
-    players = load_json(os.path.join(data_dir, "players.json"))
-    # a bad read would wipe every flip so keep the old file
-    if not isinstance(matches, list) or not matches or not isinstance(players, dict):
-        raise ValueError("match or player data missing or unreadable, corrections left as is")
+# rebuild the automatic corrections from scratch and return the number of flips
+# hand added corrections have source manual and are left alone
+def rectify():
+    conn = db.connect()
+    try:
+        return _rectify(conn)
+    finally:
+        conn.close()
+
+def _rectify(conn):
+    matches = load_matches(conn)
+    players = load_players(conn)
+    # an empty read would wipe every flip so keep the old ones
+    if not matches or not players:
+        raise ValueError("match or player data missing, corrections left as is")
 
     timelines, pos = build_timelines(matches)
     gaps = downtime_gaps(matches)
@@ -156,20 +168,29 @@ def rectify(data_dir):
             current[nm] = (st.get("ELO_RATING"), st.get("ROUNDS_WON"),
                            parse_ts(p.get("statsLastUpdated")))
 
-    corrections = {}
+    rows = []
+    now = db.now_iso()
     for m in matches:
+        # the api never corrects spectated matches so there is no point storing them
+        if m["spectated"]:
+            continue
         result = judge(m, timelines, pos, current, gaps)
-        if result and m.get("match_id"):
-            new_winner, rule, w_move, l_move = result
-            # api only reads winner
-            # the rest is there to check flips by eye
-            corrections[m["match_id"]] = {"winner": new_winner, "wasRecorded": m.get("winner"),
-                                          "rule": rule, "eloMoves": [w_move, l_move]}
+        if result:
+            # a row always means the other player won
+            # rule and elo moves are only there to check flips by eye
+            _, rule, w_move, l_move = result
+            rows.append((m["match_id"], rule, w_move, l_move, now))
 
-    save_json(os.path.join(data_dir, "corrections.json"), corrections)
-    return len(corrections)
+    # replaced in one transaction so the site never sees half the flips
+    with conn:
+        conn.execute("DELETE FROM match_corrections WHERE source = 'auto'")
+        # a manual correction on the same match wins
+        conn.executemany("INSERT OR IGNORE INTO match_corrections "
+                         "(match_id, source, rule, winner_elo_move, loser_elo_move, created_at) "
+                         "VALUES (?, 'auto', ?, ?, ?, ?)", rows)
+    return len(rows)
 
 
-# run by hand on the data folder next to this file
+# run by hand on the database
 if __name__ == "__main__":
-    print(rectify(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")), "flips")
+    print(rectify(), "flips")
