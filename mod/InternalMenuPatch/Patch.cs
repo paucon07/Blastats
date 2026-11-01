@@ -42,6 +42,9 @@ public class InternalMenuPatch : MelonMod
         BlastonTracker.Init();
     }
 
+    // after the games own camera code each frame
+    public override void OnLateUpdate() => SpectatorCamera.LateUpdate();
+
     // runs on every scene load but button setup and the watchdog only start once
     public override void OnSceneWasLoaded(int buildIndex, string sceneName)
     {
@@ -460,6 +463,7 @@ public static class BlastonTracker
     public static void Init()
     {
         var cat = MelonPreferences.CreateCategory("BlastonTracker");
+        SpectatorCamera.PovFov = cat.CreateEntry("PovFov", 90f).Value;
         DataDir = cat.CreateEntry("DataDir", "").Value;
         if (string.IsNullOrWhiteSpace(DataDir))
         {
@@ -1421,6 +1425,15 @@ public static class SpectatorCamera
     static string _commandFile;
     static DateTime _commandWritten, _nextCommandCheck;
 
+    // first person field of view in degrees measured vertically like unity does
+    // PovFov in MelonPreferences.cfg changes it and 0 leaves the games own
+    public static float PovFov = 90f;
+    static object _handler; // last handler seen so late update can reach the camera
+    static PropertyInfo _parentP;
+    static FieldInfo _parentF;
+    static Camera _camera;
+    static float _defaultFov;
+
     // camera mode and seat values from SpectatorCameraModeType and SpectatorSeatType
     const int ModeAuto = 0, ModeManual = 1;
     const int SeatThirdPerson = 1, SeatPov = 2;
@@ -1527,6 +1540,7 @@ public static class SpectatorCamera
     public static void OnTick(object handler)
     {
         if (!Init()) return;
+        _handler = handler;
         CheckCommandFile();
         try
         {
@@ -1603,6 +1617,39 @@ public static class SpectatorCamera
         }
     }
 
+    // widens the first person view and puts the games fov back for every other seat
+    public static void LateUpdate()
+    {
+        if (_handler == null || PovFov <= 0) return;
+        try
+        {
+            // found again after a scene load destroys the old camera
+            if (_camera == null)
+            {
+                if (_parentP == null && _parentF == null) Resolve(_handler.GetType(), "cameraParent", out _parentP, out _parentF);
+                var parent = Get(_handler, _parentP, _parentF) as Transform;
+                if (parent == null) return;
+                _camera = parent.GetComponentInChildren<Camera>();
+                if (_camera == null) return;
+                _defaultFov = _camera.fieldOfView;
+                BlastonTracker.Log($"spectator camera {_camera.name} has fov {_defaultFov}");
+            }
+
+            var data = Get(_handler, _dataP, _dataF);
+            bool pov = data != null && Convert.ToInt32(Get(data, _seatP, _seatF)) == SeatPov;
+            float fov = pov ? PovFov : _defaultFov;
+            if (_camera.fieldOfView != fov) _camera.fieldOfView = fov;
+        }
+        catch (Exception e)
+        {
+            if (e.Message != _lastError)
+            {
+                _lastError = e.Message;
+                BlastonTracker.Log($"camera fov error: {e.Message}");
+            }
+        }
+    }
+
     // log once per landing, not once per frame
     static void LogLanding(string what)
     {
@@ -1628,7 +1675,8 @@ public static class SpectatorCamera
             var written = File.GetLastWriteTimeUtc(_commandFile);
             if (written == _commandWritten) return;
             _commandWritten = written;
-            ApplyCommand(File.ReadAllText(_commandFile).Trim().ToLowerInvariant());
+            // a slash is allowed so the file can be typed like a chat command when testing
+            ApplyCommand(File.ReadAllText(_commandFile).Trim().TrimStart('/').ToLowerInvariant());
         }
         catch (Exception e)
         {

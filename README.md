@@ -15,6 +15,8 @@ flowchart LR
     game["Blaston Spectator<br/>+ MelonLoader mod"] -->|matches.json| poller["BlastonPoller.py"]
     game -->|24/7 stream| yt["YouTube"]
     site -.->|watch links| yt
+    yt -->|chat commands| chat["chat_camera.py"]
+    chat -->|camera_command.txt| game
     playfab["PlayFab +<br/>match server"] --> poller
     poller -->|players, ladders,<br/>matches| db[("SQLite<br/>data/blastats.db")]
     poller --> rectify["rectify.py"]
@@ -51,6 +53,7 @@ This replaced a set of JSON files that the API re-read and re-merged whenever a 
 | `store.py` | Saves matches and pairs spectated copies with announcements. Shared by the poller and the import. |
 | `import_json.py` | One off import of the old JSON files into the database. |
 | `add_tournament.py` | Adds or updates tournament results. |
+| `chat_camera.py` | Reads the stream's live chat and passes camera commands to the mod. Uses the parts of YouTube's chat stream format in `youtube_chat.proto`. |
 | `static/` | Frontend. Plain ES modules, no build step or framework. |
 
 ## Running it
@@ -98,16 +101,35 @@ python add_tournament.py --remove "Halloween Cup 2026"
 
 A tournament with the same name is replaced, so a file can be edited and loaded again.
 
+### Chat camera
+
+Viewers can change the stream camera from the live chat, with a 15 second cooldown between changes.
+
+| Command | Camera |
+| --- | --- |
+| `/auto` or `/autocamera` | The client's auto camera, cycling through the fixed views |
+| `/thirdperson` | Third person, following each round's winner |
+| `/firstperson` | First person, following each round's winner |
+| `/thirdperson pink` or `/firstperson blue` | Stays on that player |
+
+It needs a YouTube Data API key from a Google Cloud project with the YouTube Data API v3 enabled, and reads the live video from `videoId` in `data/stream_info.json`. Run it on the PC running the spectator client, since commands reach the mod through the `data/` folder.
+
+```
+setx YOUTUBE_API_KEY <key>
+python chat_camera.py
+```
+
 ### Building the mod
 
 1. Install [MelonLoader](https://melonwiki.xyz) into Blaston Spectator and launch it once so it generates `MelonLoader/Il2CppAssemblies`.
 2. Set `GamePath` near the top of `mod/InternalMenuPatch/InternalMenuPatch.csproj` to your install folder.
 3. Build, and copy `InternalMenuPatch.dll` into the game's `Mods` folder.
-4. Point the mod at the project's `data/` folder in `UserData/MelonPreferences.cfg`, with the game closed:
+4. Point the mod at the project's `data/` folder in `UserData/MelonPreferences.cfg`, with the game closed. `PovFov` is the first person camera's field of view, and 0 leaves the game's own.
 
    ```toml
    [BlastonTracker]
    DataDir = "C:/path/to/blastats/data"
+   PovFov = 90.0
    ```
 
 ## License
