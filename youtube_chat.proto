@@ -1,0 +1,52 @@
+// youtube live chat stream from the live streaming api
+// trimmed from googles stream_list proto to the fields chat_camera.py reads
+// the field numbers have to match googles or messages wont decode
+// https://developers.google.com/youtube/v3/live/streaming-live-chat
+syntax = "proto2";
+
+package youtube.api.v3;
+
+service V3DataLiveChatMessageService {
+  rpc StreamList(LiveChatMessageListRequest) returns (stream LiveChatMessageListResponse) {}
+}
+
+message LiveChatMessageListRequest {
+  optional string live_chat_id = 1;
+  optional string page_token = 99;
+  repeated string part = 100;
+}
+
+message LiveChatMessageListResponse {
+  // set once the stream has gone offline
+  optional string offline_at = 2;
+  optional string next_page_token = 100602;
+  repeated LiveChatMessage items = 1007;
+}
+
+message LiveChatMessage {
+  optional string id = 101;
+  optional LiveChatMessageSnippet snippet = 2;
+  optional LiveChatMessageAuthorDetails author_details = 3;
+}
+
+message LiveChatMessageAuthorDetails {
+  optional string display_name = 103;
+}
+
+message LiveChatMessageSnippet {
+  message TypeWrapper {
+    // only the types the script looks at and the rest read as invalid
+    enum Type {
+      INVALID_TYPE = 0;
+      TEXT_MESSAGE_EVENT = 1;
+      CHAT_ENDED_EVENT = 4;
+    }
+  }
+  optional TypeWrapper.Type type = 1;
+  optional string published_at = 4;
+  optional LiveChatTextMessageDetails text_message_details = 19;
+}
+
+message LiveChatTextMessageDetails {
+  optional string message_text = 1;
+}
