@@ -1022,24 +1022,44 @@ def get_weapons(min_elo: float | None = None, max_elo: float | None = None,
     _weapon_agg_cache[cache_key] = result
     return result
 
-# match timestamps for the activity graph
+# ranked games per utc hour for the activity heatmap
+# hourly counts instead of every timestamp so the reply stays small at every rank
+# the browser turns each utc hour into its own local day and hour
+# a game is in the lp range when both players are inside it
 @app.get("/activity")
-def get_activity(window: str = "all", min_lp: int = 0):
-    sql, params = "SELECT started_at FROM v_matches m WHERE 1 = 1", []
-    # week window cutoff
+def get_activity(window: str = "all", min_lp: int = 0, max_lp: int | None = None):
+    where, params = ["1 = 1"], []
+    # week and month window cutoffs
     # timestamps are stored in one format so they compare as text
-    if window == "week":
-        sql += " AND m.started_at >= ?"
-        params.append((datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S"))
-    # needs a player at or above min lp
+    days = {"week": 7, "month": 30}.get(window)
+    if days:
+        where.append("started_at >= ?")
+        params.append((datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S"))
+    low_lp = "MIN(COALESCE(player_one_lp, 0), COALESCE(player_two_lp, 0))"
+    high_lp = "MAX(COALESCE(player_one_lp, 0), COALESCE(player_two_lp, 0))"
     if min_lp > 0:
-        sql += " AND EXISTS (SELECT 1 FROM match_players p WHERE p.match_id = m.id AND COALESCE(p.league_points, 0) >= ?)"
+        where.append(f"{low_lp} >= ?")
         params.append(min_lp)
+    if max_lp is not None:
+        where.append(f"{high_lp} <= ?")
+        params.append(max_lp)
+    where = " AND ".join(where)
 
-    # excluded matches are already left out by the view
     with open_db() as conn:
-        timestamps = [r[0] for r in conn.execute(sql + " ORDER BY m.started_at DESC, m.id DESC", params)]
-    return {"timestamps": timestamps, "total": len(timestamps), "window": window}
+        hours = conn.execute(f"SELECT substr(started_at, 1, 13), COUNT(*) FROM v_activity WHERE {where} "
+                             "GROUP BY 1 ORDER BY 1", params).fetchall()
+        # names only so a renamed player counts twice
+        players = conn.execute(f"SELECT COUNT(*) FROM (SELECT lower(player_one) FROM v_activity WHERE {where} "
+                               f"UNION SELECT lower(player_two) FROM v_activity WHERE {where})", params * 2).fetchone()[0]
+        # slider runs from 0 to the highest lp anyone has played at
+        top = conn.execute(f"SELECT MAX({high_lp}) FROM v_activity").fetchone()[0]
+    return {
+        "hours": [[h, n] for h, n in hours],
+        "total": sum(n for _, n in hours),
+        "uniquePlayers": players,
+        "window": window,
+        "lpRange": [0, top or 0],
+    }
 
 # error handlers
 # http errors already come back as json by default

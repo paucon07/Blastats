@@ -173,6 +173,9 @@ mercury_token = None
 mercury_token_expiry = 0
 ongoing_matches = {}  # match id to live match state
 seen_match_ids = set()  # matches already handled
+# match ids in the last recent poll
+# if none of them come back in the next one some matches were probably missed
+last_recent_ids = set()
 
 # get the match server token from a playfab cloudscript function
 def fetch_mercury_token():
@@ -267,9 +270,23 @@ def fetch_account_created(pfid):
         return None
 
 # match recording
+# keep a ranked announcement for the activity view whatever rank the players are
+# one insert per new match and no extra api calls
+def record_announcement(match):
+    started = db.norm_ts(match.get("timestamp"))
+    if not started:
+        return
+    try:
+        with conn:
+            conn.execute("INSERT OR IGNORE INTO announcements VALUES (?, ?, ?, ?, ?, ?)", (
+                match["match_id"], started, match["player_one_name"], match["player_two_name"],
+                store.to_int(match.get("player_one_lp")), store.to_int(match.get("player_two_lp"))))
+    except Exception as e:
+        log(f"record_announcement error: {e}")
+
 # check the match server for newly started ranked matches
 def poll_recent_matches():
-    global mercury_token_expiry
+    global mercury_token_expiry, last_recent_ids
     ensure_mercury_token()
     if not mercury_token:
         log("no mercury token, skipping recent matches poll")
@@ -294,6 +311,13 @@ def poll_recent_matches():
         return
 
     announcements = response.json().get("recent_announcements", [])
+    # the server only returns the latest few so a busy spell can push some out between polls
+    ids = {m.get("match_id") for m in announcements if m.get("match_id")}
+    if not last_recent_ids and ids:
+        log(f"recent matches returns {len(ids)} announcements per poll")
+    elif last_recent_ids and ids and not ids & last_recent_ids:
+        log("no overlap with the last recent poll so some matches may have been missed")
+    last_recent_ids = ids or last_recent_ids
     # load tracked players once for the whole batch
     players_db = load_players()
 
@@ -311,6 +335,8 @@ def poll_recent_matches():
         p2_name = match.get("player_two_name")
         if not p1_name or not p2_name:
             continue
+        # every rank counts towards activity even when the result cant be tracked
+        record_announcement(match)
 
         # skip quietly if either player isnt tracked
         p1_id = find_pfid_by_name(players_db, p1_name)

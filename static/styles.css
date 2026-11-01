@@ -1257,6 +1257,8 @@ tr.detail-row td { padding: 0; border-bottom: 1px solid var(--border); }
   .md-players .md-player:last-child .md-player-id { text-align: left; }
 }
 .elo-filter {
+  -webkit-user-select: none;
+  user-select: none;
   background: var(--bg2);
   border: 1px solid var(--border);
   padding: 20px 24px;
@@ -1330,7 +1332,7 @@ tr.detail-row td { padding: 0; border-bottom: 1px solid var(--border); }
 }
 .elo-range::-webkit-slider-runnable-track { background: none; border: none; }
 .elo-range::-moz-range-track { background: none; border: none; }
-#elo-max { z-index: 2; }
+#elo-max, #act-max { z-index: 2; }
 .elo-range.on-top { z-index: 3; }
 
 .weapon-scatter {

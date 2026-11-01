@@ -27,12 +27,12 @@ There are two sources of match data, and the poller pairs them as they arrive.
 
 - The mod runs inside the Blaston Spectator client, which is captured and streamed to YouTube around the clock. It spectates competitive queue, and records everything the spectator view can see: loadouts, health at the end of each round, damage taken per weapon, a per hit damage timeline, grabs, ping and character portraits.
 - The poller talks to the game's backend directly. It tracks the season leaderboards and player stats, and picks up every ranked match announcement, not just the ones the mod is spectating. It works out the winner by watching each player's lifetime rounds won counter change.
-- Whichever copy of a game arrives second is paired with the first (same players, within 3 minutes), so each game is stored once. The poller also picks up new spectated matches from the mod's `matches.json`.
+- Whichever copy of a game arrives second is paired with the first (same players, within 3 minutes), so each game is stored once. The poller also picks up new spectated matches from the mod's `matches.json`, and keeps every ranked announcement at any rank for the activity heatmap, even when the result isn't tracked.
 - The API reads from the database, with result corrections applied by SQL views, and serves the site.
 
 ## Database
 
-Everything is stored in one SQLite database, `data/blastats.db`, built from [`schema.sql`](schema.sql). Each game is a row in `matches`, with its players, loadouts, rounds, per round stats and damage events in their own tables. Corrections sit in a separate table and are applied by views, so recorded results are never edited.
+Everything is stored in one SQLite database, `data/blastats.db`, built from [`schema.sql`](schema.sql). Each game is a row in `matches`, with its players, loadouts, rounds, per round stats and damage events in their own tables. Corrections sit in a separate table and are applied by views, so recorded results are never edited. Schema changes ship as numbered files in [`migrations/`](migrations) and are applied automatically the next time the poller or API starts.
 
 ![Database diagram](docs/blastats_erd.drawio.svg)
 
