@@ -1,3 +1,4 @@
+import glob
 import os
 import re
 import sqlite3
@@ -8,9 +9,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DB_FILE = os.path.join(DATA_DIR, "blastats.db")
 SCHEMA_FILE = os.path.join(BASE_DIR, "schema.sql")
+# one sql file per schema change starting with its version number
+MIGRATIONS_DIR = os.path.join(BASE_DIR, "migrations")
 
 # keep in sync with user_version at the bottom of schema.sql
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # seconds to wait for the poller to finish a write before giving up
 BUSY_TIMEOUT = 10
@@ -31,17 +34,35 @@ def connect(path=DB_FILE):
 def schema_version(db):
     return db.execute("PRAGMA user_version").fetchone()[0]
 
-# build the tables on a new database
-# an older database needs migrating so it isnt touched
+# build the tables on a new database or bring an older one up to date
 def init_db(db):
-    # version 0 means nothing has been created yet
-    if schema_version(db) == 0:
+    version = schema_version(db)
+    # version 0 means nothing has been created yet so the whole schema goes in at once
+    if version == 0:
         with open(SCHEMA_FILE, "r", encoding="utf-8") as f:
             db.executescript(f.read()) # executescript used over execute as it can run many sql statements
+    # an older database gets each migration after its version in order
+    # each file runs in its own transaction and sets the new version itself
+    elif version < SCHEMA_VERSION:
+        for v in range(version + 1, SCHEMA_VERSION + 1):
+            try:
+                db.executescript(_read_migration(v))
+            except Exception:
+                # closing rolls back a migration that failed part way
+                db.close()
+                raise
     version = schema_version(db)
     if version != SCHEMA_VERSION:
         db.close()
         raise RuntimeError(f"database is on schema version {version} but the code expects {SCHEMA_VERSION}")
+
+# sql for the migration that moves a database to version v
+def _read_migration(v):
+    files = glob.glob(os.path.join(MIGRATIONS_DIR, f"{v:03d}_*.sql"))
+    if len(files) != 1:
+        raise RuntimeError(f"expected one migration file for version {v} in {MIGRATIONS_DIR}, found {len(files)}")
+    with open(files[0], "r", encoding="utf-8") as f:
+        return f.read()
 
 # timestamps
 # iso timestamp to utc datetime or none
