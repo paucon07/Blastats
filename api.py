@@ -113,10 +113,21 @@ def _paged_ids(conn, sql, params, page, per_page):
 
 # players
 # players with their season lp from the ladders
+# the ladder only lists the top 100 so anyone below it falls back to the lp from their latest match this season
+# that lp is from the start of the match so it can be one game behind
+# sqlite takes the other columns from the row with the max so league points comes from the latest match
 PLAYERS_SQL = """
-SELECT p.*, s.current_season_lp, s.current_season_position,
-    s.previous_season_lp, s.previous_season_position
+WITH latest AS (
+    SELECT mp.player_id, mp.league_points, MAX(m.started_at)
+    FROM matches m JOIN match_players mp ON mp.match_id = m.id
+    WHERE m.started_at >= (SELECT first_seen FROM seasons WHERE status = 'current')
+        AND mp.player_id IS NOT NULL AND mp.league_points IS NOT NULL
+    GROUP BY mp.player_id
+)
+SELECT p.*, COALESCE(s.current_season_lp, latest.league_points) AS current_season_lp,
+    s.current_season_position, s.previous_season_lp, s.previous_season_position
 FROM players p JOIN v_player_standings s ON s.player_id = p.player_id
+LEFT JOIN latest ON latest.player_id = p.player_id
 """
 
 # player row and stats in the same shape as the old players json
@@ -642,7 +653,7 @@ def get_leaderboard(season: Literal["current", "previous"] = "current"):
 def get_players(sort: str = "lp", limit: int = 500, streaks: bool = False):
     # rowid keeps ties in the order players were added like before
     # only these fixed strings ever go into the query
-    order = {"lp": "COALESCE(s.current_season_lp, 0) DESC, p.rowid",
+    order = {"lp": "COALESCE(current_season_lp, 0) DESC, p.rowid",
              "first_seen": "p.first_seen DESC, p.rowid"}.get(sort, "p.rowid")
     # cap the page size
     limit = max(1, min(limit, 1000))
