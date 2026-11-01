@@ -1029,11 +1029,12 @@ def get_weapons(min_elo: float | None = None, max_elo: float | None = None,
 @app.get("/activity")
 def get_activity(window: str = "all", min_lp: int = 0, max_lp: int | None = None):
     where, params = ["1 = 1"], []
-    # week window cutoff
+    # week and month window cutoffs
     # timestamps are stored in one format so they compare as text
-    if window == "week":
+    days = {"week": 7, "month": 30}.get(window)
+    if days:
         where.append("started_at >= ?")
-        params.append((datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S"))
+        params.append((datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S"))
     low_lp = "MIN(COALESCE(player_one_lp, 0), COALESCE(player_two_lp, 0))"
     high_lp = "MAX(COALESCE(player_one_lp, 0), COALESCE(player_two_lp, 0))"
     if min_lp > 0:
@@ -1050,8 +1051,6 @@ def get_activity(window: str = "all", min_lp: int = 0, max_lp: int | None = None
         # names only so a renamed player counts twice
         players = conn.execute(f"SELECT COUNT(*) FROM (SELECT lower(player_one) FROM v_activity WHERE {where} "
                                f"UNION SELECT lower(player_two) FROM v_activity WHERE {where})", params * 2).fetchone()[0]
-        # games below the tracked players only exist from this point on
-        since = conn.execute("SELECT MIN(started_at) FROM announcements").fetchone()[0]
         # slider runs from 0 to the highest lp anyone has played at
         top = conn.execute(f"SELECT MAX({high_lp}) FROM v_activity").fetchone()[0]
     return {
@@ -1059,7 +1058,6 @@ def get_activity(window: str = "all", min_lp: int = 0, max_lp: int | None = None
         "total": sum(n for _, n in hours),
         "uniquePlayers": players,
         "window": window,
-        "allRanksSince": since,
         "lpRange": [0, top or 0],
     }
 

@@ -133,12 +133,8 @@ function renderHeatmap(data) {
   const windowBtn = (value, label) =>
     `<button class="${activityWindow === value ? 'active' : ''}" data-action="activity-window" data-value="${value}">${label}</button>`;
 
-  // games below the tracked players are only kept from a certain date
-  const since = data.allRanksSince
-    ? `Every rank since ${new Date(data.allRanksSince).toLocaleDateString()}, tracked players only before that`
-    : 'Tracked players only so far';
   const totals = `${data.total.toLocaleString()} ${plural(data.total, 'game', 'games')}, ` +
-    `${data.uniquePlayers.toLocaleString()} ${plural(data.uniquePlayers, 'player', 'players')}`;
+    `${data.uniquePlayers.toLocaleString()} ${plural(data.uniquePlayers, 'player', 'players')}, ${tzName} time`;
 
   // the slider is drawn once and left alone so redrawing never interrupts a drag
   if (!document.getElementById('activity-grid')) {
@@ -150,10 +146,9 @@ function renderHeatmap(data) {
     <div class="section-header compact">
       <div>
         <div class="section-title">Activity Heatmap</div>
-        <div class="section-sub">Ranked games by day &amp; hour, ${esc(tzName)} time</div>
-        <div class="section-sub">${esc(totals)}. ${esc(since)}</div>
+        <div class="section-sub">${esc(totals)}</div>
       </div>
-      <div class="season-toggle">${windowBtn('all', 'All Time')}${windowBtn('week', 'Past Week')}</div>
+      <div class="season-toggle">${windowBtn('all', 'All Time')}${windowBtn('month', 'Past Month')}${windowBtn('week', 'Past Week')}</div>
     </div>`;
   document.getElementById('activity-grid').innerHTML = `
     <div class="table-wrap heatmap-wrap">
@@ -162,7 +157,7 @@ function renderHeatmap(data) {
         <span>LESS</span>
         <div class="hm-scale">${swatches}</div>
         <span>MORE</span>
-        <span class="hm-peak">PEAK: ${max} ${plural(max, 'game', 'games')} in one hour</span>
+        <span class="hm-peak">PEAK: ${max} ${plural(max, 'game', 'games')}</span>
       </div>
     </div>`;
 
@@ -190,7 +185,7 @@ function lpSliderHtml() {
   return `
     <div class="elo-filter">
       <div class="elo-filter-head">
-        <span class="elo-filter-label">LP Range, both players</span>
+        <span class="elo-filter-label">LP Range</span>
         <span class="elo-filter-values"><span id="act-min-label">${lpMin}</span> - <span id="act-max-label">${lpMax}</span></span>
       </div>
       <div class="elo-slider">
@@ -232,6 +227,10 @@ function bindLpSlider() {
     lpMax = Math.max(parseInt(maxI.value, 10), lpMin);
     maxI.value = lpMax; paint(); schedule();
   });
+  // pressing the bare track used to select the panel text
+  // grabbing a thumb after that dragged the selection and blocked the slider
+  document.querySelector('#act-min').closest('.elo-filter')
+    .addEventListener('dragstart', e => e.preventDefault());
   paint();
 }
 
