@@ -1422,8 +1422,8 @@ public static class SpectatorCamera
     static View _view = View.ThirdPerson;
     // network id chat pinned the camera to or 0 to follow round winners
     static int _fixedPlayer;
-    static string _commandFile;
-    static DateTime _commandWritten, _nextCommandCheck;
+    static string _commandFile, _duelFile;
+    static DateTime _commandWritten, _nextFileCheck, _nextDuelMark;
 
     // first person field of view in degrees measured vertically like unity does
     // PovFov in MelonPreferences.cfg changes it and 0 leaves the games own
@@ -1541,7 +1541,13 @@ public static class SpectatorCamera
     {
         if (!Init()) return;
         _handler = handler;
-        CheckCommandFile();
+        // files are checked once a second since the camera ticks every frame
+        if (DateTime.UtcNow >= _nextFileCheck)
+        {
+            _nextFileCheck = DateTime.UtcNow.AddSeconds(1);
+            CheckCommandFile();
+            MarkDuel(handler);
+        }
         try
         {
             var data = Get(handler, _dataP, _dataF);
@@ -1659,11 +1665,8 @@ public static class SpectatorCamera
     }
 
     // chat_camera.py writes the latest chat command to this file
-    // checked once a second since the camera ticks every frame
     static void CheckCommandFile()
     {
-        if (DateTime.UtcNow < _nextCommandCheck) return;
-        _nextCommandCheck = DateTime.UtcNow.AddSeconds(1);
         try
         {
             if (_commandFile == null)
@@ -1681,6 +1684,35 @@ public static class SpectatorCamera
         catch (Exception e)
         {
             BlastonTracker.Log($"camera command error: {e.Message}");
+        }
+    }
+
+    // rewrites duel_live.txt every few seconds while both players are in the arena
+    // chat_camera.py only reads chat while it is fresh so quota isnt spent between matches
+    // a heartbeat instead of start and end markers so a crash or missed match end cant leave it on
+    static void MarkDuel(object handler)
+    {
+        if (DateTime.UtcNow < _nextDuelMark) return;
+        try
+        {
+            if (_duelFile == null)
+            {
+                if (BlastonTracker.DataDir == null) return;
+                _duelFile = Path.Combine(BlastonTracker.DataDir, "duel_live.txt");
+            }
+            var p1 = FindPlayer(handler, 1);
+            var p2 = FindPlayer(handler, 2);
+            if (p1 == null || p2 == null || !PlayerRigLive(p1) || !PlayerRigLive(p2)) return;
+            File.WriteAllText(_duelFile, DateTime.UtcNow.ToString("o"));
+            _nextDuelMark = DateTime.UtcNow.AddSeconds(5);
+        }
+        catch (Exception e)
+        {
+            if (e.Message != _lastError)
+            {
+                _lastError = e.Message;
+                BlastonTracker.Log($"duel marker error: {e.Message}");
+            }
         }
     }
 
