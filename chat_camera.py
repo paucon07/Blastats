@@ -9,7 +9,7 @@ import requests
 import db
 
 # reads the youtube live chat and passes camera commands to the spectator mod
-# the latest command goes in camera_command txt in the data folder which the mod checks every second
+# the latest command goes in camera_command.txt in the data folder which the mod checks every second
 # chat is only read while a duel is on since the camera has nothing to show between matches
 # needs a youtube data api key in the YOUTUBE_API_KEY environment variable
 
@@ -23,7 +23,7 @@ CHAT_HOST = "youtube.googleapis.com:443"
 VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 REQUEST_TIMEOUT = 15  # seconds before a request gives up
 
-COOLDOWN = 15  # seconds before chat can change the camera again
+COOLDOWN = 3  # seconds before chat can change the camera again
 OFFLINE_WAIT = 300  # seconds between checks while the stream isnt live
 QUOTA_WAIT = 3600  # seconds to back off if youtube says the quota ran out anyway
 
@@ -87,8 +87,9 @@ def live_chat_id(key):
         log("no videoId in stream_info.json")
         return None
     spend(LOOKUP_COST)
-    r = requests.get(VIDEOS_URL, params={"part": "liveStreamingDetails", "id": video, "key": key},
-                     timeout=REQUEST_TIMEOUT)
+    # key in a header so an error message with the url in it cant leak it into the log
+    r = requests.get(VIDEOS_URL, params={"part": "liveStreamingDetails", "id": video},
+                     headers={"X-Goog-Api-Key": key}, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     items = r.json().get("items") or []
     return (items[0].get("liveStreamingDetails") or {}).get("activeLiveChatId") if items else None
@@ -181,7 +182,9 @@ def handle(message):
         return True
     write_command(command)
     current, last_change = command, time.time()
-    log(f"{message.author_details.display_name}: {command}")
+    # whitespace squashed so a name cant break up lines in the log
+    name = " ".join(message.author_details.display_name.split())
+    log(f"{name}: {command}")
     return True
 
 # read the chat during duels and reconnect from where it left off each time youtube closes it
