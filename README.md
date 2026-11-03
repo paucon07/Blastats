@@ -103,7 +103,7 @@ A tournament with the same name is replaced, so a file can be edited and loaded 
 
 ### Chat camera
 
-Viewers can change the stream camera from the live chat, with a 15 second cooldown between changes.
+Viewers can change the stream camera from the live chat, with a 3 second cooldown between changes.
 
 | Command | Camera |
 | --- | --- |
