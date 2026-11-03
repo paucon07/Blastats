@@ -42,6 +42,9 @@ public class InternalMenuPatch : MelonMod
         BlastonTracker.Init();
     }
 
+    // after the games own camera code each frame
+    public override void OnLateUpdate() => SpectatorCamera.LateUpdate();
+
     // runs on every scene load but button setup and the watchdog only start once
     public override void OnSceneWasLoaded(int buildIndex, string sceneName)
     {
@@ -451,7 +454,8 @@ public static class BlastonTracker
 {
     // blastats data folder that api.py and the poller read from
     // set in UserData/MelonPreferences.cfg
-    private static string DataDir;
+    // public so the camera can read chat commands from it
+    public static string DataDir { get; private set; }
     private static string LogPath;
     private static string AvatarDir; // served at /avatars/{sprite}.png
 
@@ -459,6 +463,7 @@ public static class BlastonTracker
     public static void Init()
     {
         var cat = MelonPreferences.CreateCategory("BlastonTracker");
+        SpectatorCamera.PovFov = cat.CreateEntry("PovFov", 90f).Value;
         DataDir = cat.CreateEntry("DataDir", "").Value;
         if (string.IsNullOrWhiteSpace(DataDir))
         {
@@ -1411,13 +1416,35 @@ public static class SpectatorCamera
 {
     public static int TargetNetworkId = 1; // round 1 starts on player 1, then follows round winners
 
+    // view picked from the stream chat by chat_camera.py
+    // auto hands the camera back to the games own auto mode
+    public enum View { Auto, ThirdPerson, FirstPerson }
+    static View _view = View.ThirdPerson;
+    // network id chat pinned the camera to or 0 to follow round winners
+    static int _fixedPlayer;
+    static string _commandFile, _duelFile;
+    static DateTime _commandWritten, _nextFileCheck, _nextDuelMark;
+
+    // first person field of view in degrees measured vertically like unity does
+    // PovFov in MelonPreferences.cfg changes it and 0 leaves the games own
+    public static float PovFov = 90f;
+    static object _handler; // last handler seen so late update can reach the camera
+    static PropertyInfo _parentP;
+    static FieldInfo _parentF;
+    static Camera _camera;
+    static float _defaultFov;
+
+    // camera mode and seat values from SpectatorCameraModeType and SpectatorSeatType
+    const int ModeAuto = 0, ModeManual = 1;
+    const int SeatThirdPerson = 1, SeatPov = 2;
+
     const BindingFlags F = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
 
     static bool _ready, _initLogged;
-    static int _loggedTarget = -1; // last target we logged landing on
+    static string _logged; // last view and target we logged landing on
     static string _lastError; // stops a repeating error spamming every frame
-    static PropertyInfo _dataP, _gdP, _followedP, _modeP, _seatP, _netIdP, _viewsP, _inputP, _tp1P, _tp2P, _ccmP;
-    static FieldInfo _dataF, _gdF, _followedF, _modeF, _seatF, _viewsF, _inputF, _tp1F, _tp2F, _ccmF;
+    static PropertyInfo _dataP, _gdP, _followedP, _modeP, _seatP, _netIdP, _viewsP, _inputP, _tp1P, _tp2P, _pov1P, _pov2P, _ccmP;
+    static FieldInfo _dataF, _gdF, _followedF, _modeF, _seatF, _viewsF, _inputF, _tp1F, _tp2F, _pov1F, _pov2F, _ccmF;
     static PropertyInfo _playerRefP, _tpPointP, _posP;
 
     // members can be a property or a field so resolve whichever exists
@@ -1509,56 +1536,82 @@ public static class SpectatorCamera
         return null;
     }
 
-    // called every camera tick, nudges the game input until the camera follows the target
+    // called every camera tick, nudges the game input until the camera shows the chosen view
     public static void OnTick(object handler)
     {
         if (!Init()) return;
+        _handler = handler;
+        // files are checked once a second since the camera ticks every frame
+        if (DateTime.UtcNow >= _nextFileCheck)
+        {
+            _nextFileCheck = DateTime.UtcNow.AddSeconds(1);
+            CheckCommandFile();
+            MarkDuel(handler);
+        }
         try
         {
             var data = Get(handler, _dataP, _dataF);
             if (data == null) return;
+            var input = Get(handler, _inputP, _inputF);
+            if (input == null) return;
+            if (_ccmP == null && _ccmF == null)
+            {
+                var it = input.GetType();
+                Resolve(it, "changeCameraMode", out _ccmP, out _ccmF);
+                Resolve(it, "thirdPersonPlayer1", out _tp1P, out _tp1F);
+                Resolve(it, "thirdPersonPlayer2", out _tp2P, out _tp2F);
+                Resolve(it, "povPlayer1", out _pov1P, out _pov1F);
+                Resolve(it, "povPlayer2", out _pov2P, out _pov2F);
+            }
+            int mode = Convert.ToInt32(Get(data, _modeP, _modeF));
 
+            // change mode steps through auto manual and freecam so keep pressing until it lands on auto
+            if (_view == View.Auto)
+            {
+                if (mode != ModeAuto) Set(input, _ccmP, _ccmF, true);
+                else LogLanding("auto camera");
+                return;
+            }
+
+            int target = _fixedPlayer != 0 ? _fixedPlayer : TargetNetworkId;
+            int wantSeat = _view == View.FirstPerson ? SeatPov : SeatThirdPerson;
             var followedPlayer = Get(handler, _followedP, _followedF);
             int followed = NetworkIdOf(followedPlayer);
             int seat = Convert.ToInt32(Get(data, _seatP, _seatF));
 
             // already on the target, but only if their rig is live
             // the handler keeps last matchs player which has the same id but a dead rig
-            if (seat == 1 && followed == TargetNetworkId
+            if (mode == ModeManual && seat == wantSeat && followed == target
                 && followedPlayer != null && PlayerRigLive(followedPlayer))
             {
-                // log once per landing, not once per frame
-                if (_loggedTarget != TargetNetworkId)
-                {
-                    _loggedTarget = TargetNetworkId;
-                    BlastonTracker.Log($"camera following player {TargetNetworkId}");
-                }
+                LogLanding($"{(_view == View.FirstPerson ? "first" : "third")} person on player {target}");
                 return;
             }
 
-            var player = FindPlayer(handler, TargetNetworkId);
+            var player = FindPlayer(handler, target);
             if (player == null) return;
             if (Get(data, _viewsP, _viewsF) == null) return;
             if (!PlayerRigLive(player)) return;
 
-            var input = Get(handler, _inputP, _inputF);
-            if (input == null) return;
-            if (_tp1P == null && _tp1F == null) Resolve(input.GetType(), "thirdPersonPlayer1", out _tp1P, out _tp1F);
-            if (_tp2P == null && _tp2F == null) Resolve(input.GetType(), "thirdPersonPlayer2", out _tp2P, out _tp2F);
-            if (_ccmP == null && _ccmF == null) Resolve(input.GetType(), "changeCameraMode", out _ccmP, out _ccmF);
-
-            // still in auto so press change mode first, manual is 1
-            int mode = Convert.ToInt32(Get(data, _modeP, _modeF));
-            if (mode != 1)
+            // still in auto or freecam so press change mode first
+            if (mode != ModeManual)
             {
                 Set(input, _ccmP, _ccmF, true);
                 return;
             }
 
-            // in manual so keep pressing the third person key for the target
-            if (TargetNetworkId == 1) Set(input, _tp1P, _tp1F, true);
-            else Set(input, _tp2P, _tp2F, true);
-
+            // in manual so keep pressing the key for the target
+            // 7 and 8 are third person and 9 and 0 first person
+            if (_view == View.FirstPerson)
+            {
+                if (target == 1) Set(input, _pov1P, _pov1F, true);
+                else Set(input, _pov2P, _pov2F, true);
+            }
+            else
+            {
+                if (target == 1) Set(input, _tp1P, _tp1F, true);
+                else Set(input, _tp2P, _tp2F, true);
+            }
         }
         catch (Exception e)
         {
@@ -1570,6 +1623,130 @@ public static class SpectatorCamera
         }
     }
 
-    // new match always starts on player 1
-    public static void ResetForNewMatch() { TargetNetworkId = 1; _loggedTarget = -1; }
-}
+    // widens the first person view and puts the games fov back for every other seat
+    public static void LateUpdate()
+    {
+        if (_handler == null || PovFov <= 0) return;
+        try
+        {
+            // found again after a scene load destroys the old camera
+            if (_camera == null)
+            {
+                if (_parentP == null && _parentF == null) Resolve(_handler.GetType(), "cameraParent", out _parentP, out _parentF);
+                var parent = Get(_handler, _parentP, _parentF) as Transform;
+                if (parent == null) return;
+                _camera = parent.GetComponentInChildren<Camera>();
+                if (_camera == null) return;
+                _defaultFov = _camera.fieldOfView;
+                BlastonTracker.Log($"spectator camera {_camera.name} has fov {_defaultFov}");
+            }
+
+            var data = Get(_handler, _dataP, _dataF);
+            bool pov = data != null && Convert.ToInt32(Get(data, _seatP, _seatF)) == SeatPov;
+            float fov = pov ? PovFov : _defaultFov;
+            if (_camera.fieldOfView != fov) _camera.fieldOfView = fov;
+        }
+        catch (Exception e)
+        {
+            if (e.Message != _lastError)
+            {
+                _lastError = e.Message;
+                BlastonTracker.Log($"camera fov error: {e.Message}");
+            }
+        }
+    }
+
+    // log once per landing, not once per frame
+    static void LogLanding(string what)
+    {
+        if (_logged == what) return;
+        _logged = what;
+        BlastonTracker.Log($"camera on {what}");
+    }
+
+    // chat_camera.py writes the latest chat command to this file
+    static void CheckCommandFile()
+    {
+        try
+        {
+            if (_commandFile == null)
+            {
+                if (BlastonTracker.DataDir == null) return;
+                _commandFile = Path.Combine(BlastonTracker.DataDir, "camera_command.txt");
+            }
+            if (!File.Exists(_commandFile)) return;
+            var written = File.GetLastWriteTimeUtc(_commandFile);
+            if (written == _commandWritten) return;
+            _commandWritten = written;
+            // a slash is allowed so the file can be typed like a chat command when testing
+            ApplyCommand(File.ReadAllText(_commandFile).Trim().TrimStart('/').ToLowerInvariant());
+        }
+        catch (Exception e)
+        {
+            BlastonTracker.Log($"camera command error: {e.Message}");
+        }
+    }
+
+    // rewrites duel_live.txt every few seconds while both players are in the arena
+    // chat_camera.py only reads chat while it is fresh so quota isnt spent between matches
+    // a heartbeat instead of start and end markers so a crash or missed match end cant leave it on
+    static void MarkDuel(object handler)
+    {
+        if (DateTime.UtcNow < _nextDuelMark) return;
+        try
+        {
+            if (_duelFile == null)
+            {
+                if (BlastonTracker.DataDir == null) return;
+                _duelFile = Path.Combine(BlastonTracker.DataDir, "duel_live.txt");
+            }
+            var p1 = FindPlayer(handler, 1);
+            var p2 = FindPlayer(handler, 2);
+            if (p1 == null || p2 == null || !PlayerRigLive(p1) || !PlayerRigLive(p2)) return;
+            File.WriteAllText(_duelFile, DateTime.UtcNow.ToString("o"));
+            _nextDuelMark = DateTime.UtcNow.AddSeconds(5);
+        }
+        catch (Exception e)
+        {
+            if (e.Message != _lastError)
+            {
+                _lastError = e.Message;
+                BlastonTracker.Log($"duel marker error: {e.Message}");
+            }
+        }
+    }
+
+    // auto or thirdperson or firstperson with an optional colour
+    // no colour follows the round winner and pink is player 1 and blue player 2 like the match pages
+    public static void ApplyCommand(string command)
+    {
+        var words = command.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+        if (words.Length == 0) return;
+
+        View view;
+        if (words[0] == "auto") view = View.Auto;
+        else if (words[0] == "thirdperson") view = View.ThirdPerson;
+        else if (words[0] == "firstperson") view = View.FirstPerson;
+        else
+        {
+            BlastonTracker.Log($"unknown camera command {command}");
+            return;
+        }
+
+        int player = 0;
+        if (words.Length > 1 && view != View.Auto)
+        {
+            if (words[1] == "pink") player = 1;
+            else if (words[1] == "blue") player = 2;
+        }
+
+        _view = view;
+        _fixedPlayer = player;
+        _logged = null;
+        BlastonTracker.Log($"camera command {command}");
+    }
+
+    // new match starts following player 1 again
+    // a view picked in chat carries over
+    public static void ResetForNewMatch() { TargetNetworkId = 1; _logged = null; }
+}
