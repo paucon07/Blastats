@@ -1749,4 +1749,4 @@ public static class SpectatorCamera
     // new match starts following player 1 again
     // a view picked in chat carries over
     public static void ResetForNewMatch() { TargetNetworkId = 1; _logged = null; }
-}
+}
