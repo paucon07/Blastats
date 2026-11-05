@@ -53,6 +53,7 @@ This replaced a set of JSON files that the API re-read and re-merged whenever a 
 | `store.py` | Saves matches and pairs spectated copies with announcements. Shared by the poller and the import. |
 | `import_json.py` | One off import of the old JSON files into the database. |
 | `add_tournament.py` | Adds or updates tournament results. |
+| `backup_db.py` | Backs up the database and keeps the newest copies. |
 | `chat_camera.py` | Reads the stream's live chat and passes camera commands to the mod. Uses the parts of YouTube's chat stream format in `youtube_chat.proto`. |
 | `static/` | Frontend. Plain ES modules, no build step or framework. |
 
@@ -100,6 +101,16 @@ python add_tournament.py --remove "Halloween Cup 2026"
 ```
 
 A tournament with the same name is replaced, so a file can be edited and loaded again.
+
+### Backups
+
+`data/` isn't part of the repo, so the database is backed up separately. The backup is safe to run while the poller and API are running, and keeps the newest 7 copies.
+
+```
+python backup_db.py --dest "C:/path/to/OneDrive/Blastats backups"
+```
+
+To run it daily, add it to Task Scheduler with the full path to `python.exe`. To restore, stop the poller and API, delete `blastats.db-wal` and `blastats.db-shm` from `data/`, and copy a backup in as `data/blastats.db`.
 
 ### Chat camera
 
