@@ -6,7 +6,9 @@ import db
 # elo moves this size or smaller are noise
 EPS = 2
 # min elo gap for a silent upset
-MIN_GAP = 200
+# checked against spectated matches where the real winner is known
+# below 400 a favourite still gains a few elo so nobody moving doesnt mean they won
+MIN_GAP = 400
 # no matches from anyone for this long means the tracker was down
 DOWNTIME_HOURS = 18
 
